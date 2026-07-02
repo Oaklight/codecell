@@ -16,6 +16,7 @@ Quick start::
 from ._runtime import (
     MAX_OUTPUT_BYTES,
     BaseRuntime,
+    IpcSubprocessRuntime,
     NullValidator,
     SubprocessRuntime,
     Validator,
@@ -23,11 +24,12 @@ from ._runtime import (
 )
 from ._types import CodeResult
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BaseRuntime",
     "CodeResult",
+    "IpcSubprocessRuntime",
     "MAX_OUTPUT_BYTES",
     "NullValidator",
     "SubprocessRuntime",
