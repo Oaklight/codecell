@@ -18,9 +18,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install pre-commit
+      - run: pip install pre-commit ty
 
-      - name: Lint (ruff)
+      - name: Lint (ruff + ty)
         run: pre-commit run --all-files
 
   test:

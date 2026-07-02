@@ -5,3 +5,14 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check
+        description: Type check codecell/ with ty.
+        entry: ty check codecell/
+        language: system
+        pass_filenames: false
+        require_serial: true
+        types: [python]
