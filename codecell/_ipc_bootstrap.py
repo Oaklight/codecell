@@ -71,7 +71,12 @@ def main() -> None:
         sys.exit(1)
     init = json.loads(init_line)
 
-    tool_names: list[str] = init["tools"]
+    # tools can be a list of names (legacy) or a dict of name→doc
+    raw_tools = init["tools"]
+    if isinstance(raw_tools, dict):
+        tool_docs: dict[str, str | None] = raw_tools
+    else:
+        tool_docs = {name: None for name in raw_tools}
     code: str = init["code"]
 
     # Rewire _send/_recv to use the real stdout/stdin
@@ -92,9 +97,9 @@ def main() -> None:
 
     # Build stub namespace
     namespace: dict = {}
-    for name in tool_names:
+    for name, doc in tool_docs.items():
 
-        def make_stub_fn(tool_name: str) -> Callable[..., Any]:
+        def make_stub_fn(tool_name: str, tool_doc: str | None) -> Callable[..., Any]:
             def stub(**kwargs):
                 send_to_main({"type": "call", "tool": tool_name, "kwargs": kwargs})
                 resp = recv_from_main()
@@ -104,9 +109,10 @@ def main() -> None:
 
             stub.__name__ = tool_name
             stub.__qualname__ = tool_name
+            stub.__doc__ = tool_doc
             return stub
 
-        namespace[name] = make_stub_fn(name)
+        namespace[name] = make_stub_fn(name, doc)
 
     # Execute the code
     import builtins

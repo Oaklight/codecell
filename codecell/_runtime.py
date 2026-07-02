@@ -308,7 +308,11 @@ class IpcSubprocessRuntime(BaseRuntime):
                 "Only Python runtimes support callable namespace."
             )
 
-        tool_names = list(namespace.keys()) if namespace else []
+        # Build tool_docs: {name: docstring} for the subprocess stubs
+        tool_docs: dict[str, str | None] = {}
+        if namespace:
+            for name, fn in namespace.items():
+                tool_docs[name] = getattr(fn, "__doc__", None)
 
         # Spawn subprocess running the bootstrap script
         proc = subprocess.Popen(
@@ -320,7 +324,7 @@ class IpcSubprocessRuntime(BaseRuntime):
         )
 
         try:
-            return self._dispatch_loop(proc, code, tool_names, namespace or {}, timeout)
+            return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
         except Exception:
             proc.kill()
             raise
@@ -335,7 +339,7 @@ class IpcSubprocessRuntime(BaseRuntime):
         self,
         proc: subprocess.Popen,
         code: str,
-        tool_names: list[str],
+        tool_docs: dict[str, str | None],
         namespace: dict[str, Callable[..., Any]],
         timeout: float | None,
     ) -> CodeResult:
@@ -353,8 +357,8 @@ class IpcSubprocessRuntime(BaseRuntime):
         assert proc.stdout is not None
         assert proc.stderr is not None
 
-        # Send init message
-        init_msg = json.dumps({"type": "init", "tools": tool_names, "code": code})
+        # Send init message with tool docs for help() support
+        init_msg = json.dumps({"type": "init", "tools": tool_docs, "code": code})
         proc.stdin.write(init_msg + "\n")
         proc.stdin.flush()
 
