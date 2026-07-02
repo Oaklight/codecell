@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codecell"
+dynamic = ["version"]
+description = "Stateless, subprocess-isolated code execution for LLM agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Peng Ding", email = "oaklight.peng@gmail.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff==0.15.20"]
+test = ["pytest>=7.0.0"]
+
+[project.urls]
+Repository = "https://github.com/Oaklight/codecell"
+Issues = "https://github.com/Oaklight/codecell/issues"
+
+[tool.setuptools.packages.find]
+include = ["codecell*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "codecell.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

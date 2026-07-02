@@ -1,0 +1,12 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: ./.github/workflows/lint-test.yml
