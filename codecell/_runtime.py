@@ -561,7 +561,7 @@ class SubprocessRuntime(BaseRuntime):
 
         # The child leads its own process group (POSIX) so the whole descendant
         # tree can be torn down if it times out, crashes, or the caller cancels.
-        proc = subprocess.Popen(
+        proc = subprocess.Popen[bytes](
             [*self._validator.interpreter, script],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -694,7 +694,7 @@ class IpcSubprocessRuntime(BaseRuntime):
 
         # Spawn subprocess running the bootstrap script.  The child leads its own
         # process group (POSIX) so its descendants can be killed with it.
-        proc = subprocess.Popen(
+        proc = subprocess.Popen[bytes](
             [sys.executable, "-m", "codecell._ipc_bootstrap"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
