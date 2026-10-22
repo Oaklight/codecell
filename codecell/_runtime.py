@@ -7,8 +7,12 @@ and provide their own validation logic and interpreter invocation.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -37,6 +41,97 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return truncated + "\n... [output truncated]"
+
+
+# ---------------------------------------------------------------------------
+# Process-group teardown
+# ---------------------------------------------------------------------------
+# Executed code routinely spawns processes of its own.  Killing only the direct
+# child leaves that whole tree running after ``execute()`` returns, so every child
+# is started as the leader of its own process group (POSIX) and the group is torn
+# down on timeout, crash, or caller cancellation.
+#
+# Windows has no process groups, so only the direct child can be terminated
+# there and grandchildren may survive.
+
+_IS_POSIX = os.name == "posix"
+
+# Seconds a process group gets to exit on SIGTERM before it is SIGKILLed.
+SIGTERM_GRACE_SECONDS = 1.0
+
+# Seconds allowed to collect output already buffered in the pipes after the group
+# was killed.  A process that left the group while holding a pipe can keep it open
+# indefinitely, so capture is bounded instead of waited on.
+POST_KILL_DRAIN_SECONDS = 1.0
+
+_GROUP_POLL_INTERVAL = 0.02
+
+
+def _spawn_kwargs() -> dict[str, Any]:
+    """Extra ``Popen`` kwargs that put the child in its own process group."""
+    return {"start_new_session": True} if _IS_POSIX else {}
+
+
+def _signal_group(proc: subprocess.Popen[Any], sig: int) -> None:
+    """Send *sig* to the child's process group (POSIX) or to the child alone."""
+    if proc.pid <= 1:  # never signal our own group
+        return
+    with contextlib.suppress(OSError):
+        if _IS_POSIX:
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+
+
+def _group_alive(proc: subprocess.Popen[Any]) -> bool:
+    """Whether the child's process group still has a live member."""
+    if not _IS_POSIX:
+        return proc.poll() is None
+    if proc.pid <= 1:
+        return False
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_group(proc: subprocess.Popen[Any]) -> None:
+    """SIGKILL the child's process group (POSIX) or the child itself."""
+    if _IS_POSIX:
+        _signal_group(proc, signal.SIGKILL)
+    else:
+        with contextlib.suppress(OSError):
+            proc.kill()
+
+
+def _terminate_process_group(
+    proc: subprocess.Popen[Any], grace: float = SIGTERM_GRACE_SECONDS
+) -> None:
+    """Reap *proc* and kill whatever it left running in its process group.
+
+    Idempotent, and safe on a child that has already exited: the group is
+    checked before the leader is reaped, so a live group is never signalled
+    through a recycled pid, and signals are never sent to our own group.
+    """
+    if _group_alive(proc):
+        _signal_group(proc, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not _group_alive(proc):
+                break
+            # Reaping the leader is what lets an exited-but-unreaped child stop
+            # counting as a live group member.
+            proc.poll()
+            time.sleep(_GROUP_POLL_INTERVAL)
+        else:
+            _kill_group(proc)
+
+    if proc.poll() is None:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
 
 
 class Validator(ABC):
@@ -191,28 +286,42 @@ class SubprocessRuntime(BaseRuntime):
 
         script = self._build_script(code, namespace)
 
+        # The child leads its own process group (POSIX) so a timeout or a caller
+        # cancellation takes down the whole descendant tree, not just the child.
+        proc = subprocess.Popen(
+            [*self._validator.interpreter, script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_spawn_kwargs(),
+        )
+
+        stdout = stderr = ""
         try:
-            result = subprocess.run(
-                [*self._validator.interpreter, script],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(proc)
+            # ``communicate`` keeps what it has already read, so a retry returns
+            # the partial output.  It is bounded: a process that escaped the
+            # group can hold the pipes open indefinitely.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                stdout, stderr = proc.communicate(timeout=POST_KILL_DRAIN_SECONDS)
             return CodeResult(
-                stdout=truncate(result.stdout),
-                stderr=truncate(result.stderr),
-                return_code=result.returncode,
-                timed_out=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout
-            stderr = exc.stderr
-            return CodeResult(
-                stdout=truncate(stdout if isinstance(stdout, str) else ""),
-                stderr=truncate(stderr if isinstance(stderr, str) else ""),
+                stdout=truncate(stdout),
+                stderr=truncate(stderr),
                 return_code=-1,
                 timed_out=True,
             )
+        except BaseException:
+            _terminate_process_group(proc)
+            raise
+
+        return CodeResult(
+            stdout=truncate(stdout),
+            stderr=truncate(stderr),
+            return_code=proc.returncode,
+            timed_out=False,
+        )
 
     def _build_script(
         self,
@@ -328,26 +437,23 @@ class IpcSubprocessRuntime(BaseRuntime):
             for name, fn in namespace.items():
                 tool_docs[name] = getattr(fn, "__doc__", None)
 
-        # Spawn subprocess running the bootstrap script
+        # Spawn subprocess running the bootstrap script.  It leads its own
+        # process group (POSIX) so its descendants can be killed with it.
         proc = subprocess.Popen(
             [sys.executable, "-m", "codecell._ipc_bootstrap"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **_spawn_kwargs(),
         )
 
         try:
             return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
-        except Exception:
-            proc.kill()
-            raise
         finally:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # Single owner of teardown: reap the child and clear anything it left
+            # behind, on every path -- return, crash, timeout, or cancellation.
+            _terminate_process_group(proc)
 
     def _dispatch_loop(
         self,
@@ -365,7 +471,6 @@ class IpcSubprocessRuntime(BaseRuntime):
         import json
         import queue
         import threading
-        import time
 
         assert proc.stdin is not None
         assert proc.stdout is not None
@@ -390,14 +495,16 @@ class IpcSubprocessRuntime(BaseRuntime):
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()
 
-        deadline = time.monotonic() + timeout if timeout else None
+        # ``timeout=0`` means "fail immediately", as in SubprocessRuntime; only
+        # ``None`` disables the deadline.
+        deadline = time.monotonic() + timeout if timeout is not None else None
 
         while True:
             # Calculate remaining time for queue.get
-            if deadline:
+            if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    proc.kill()
+                    # Teardown belongs to execute()'s finally, not here.
                     return CodeResult(
                         stdout="",
                         stderr="",
@@ -410,8 +517,7 @@ class IpcSubprocessRuntime(BaseRuntime):
             try:
                 line = line_queue.get(timeout=remaining)
             except queue.Empty:
-                # Timeout
-                proc.kill()
+                # Timeout; execute()'s finally tears the group down.
                 return CodeResult(
                     stdout="",
                     stderr="",
