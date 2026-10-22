@@ -156,8 +156,17 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 - [ ] Implements cancellation as a lifecycle operation with defined semantics for
       in-flight calls, and terminates the whole process/container tree.
 - [ ] Never interprets tool semantics (no filtering, authorization, caching, logging).
+- [ ] Bounds every buffer the caller allocates with a ceiling that does not depend on how
+      much the executed code writes.
 - [ ] Truncates returned output consistently (64 KiB per stream).
+- [ ] Keeps failures and successes distinct in both directions: a tool failure never
+      arrives as a value, and a successful value never arrives as a failure (the defect
+      #7 fixes).
 - [ ] Propagates tool errors verbatim as `result.error` strings.
+- [ ] Carries no state across executions: no module cache, variable, or namespace
+      survives into the next call.
+- [ ] Reports `rc`, `stdout`, `stderr`, and `timed_out` without deciding whether the
+      outcome is acceptable.
 - [ ] Documents any capability the channel adds or removes relative to the subprocess
       backend.
 
