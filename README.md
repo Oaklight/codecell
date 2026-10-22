@@ -121,7 +121,7 @@ Execute code in a subprocess. The validator provides language identity and code 
 
 ## Documentation
 
-- [RUNTIME_CONTRACT.md](RUNTIME_CONTRACT.md) — the IPC wire protocol, the runtime/caller division of responsibility, and the checklist a new backend must satisfy.
+- [RUNTIME_CONTRACT.md](https://github.com/Oaklight/codecell/blob/master/RUNTIME_CONTRACT.md) — the IPC wire protocol, the runtime/caller division of responsibility, and the checklist a new backend must satisfy.
 
 ## License
 

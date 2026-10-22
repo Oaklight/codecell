@@ -272,12 +272,11 @@ class IpcSubprocessRuntime(BaseRuntime):
         - No cloudpickle needed for tools
         - Tools retain access to main-process state (connections, env)
 
-    Protocol (JSON lines over stdin/stdout pipe):
-
-        Main → Sub:  ``{"type": "init", "tools": [...], "code": "..."}``
-        Sub → Main:  ``{"type": "call", "tool": "name", "kwargs": {...}}``
-        Main → Sub:  ``{"type": "result", "value": ...}``
-        Sub → Main:  ``{"type": "done", "stdout": "...", "stderr": "...", "rc": 0}``
+    The wire protocol (``init`` / ``call`` / ``result`` / ``done``), its
+    error semantics, and the backend compliance checklist are specified in
+    ``RUNTIME_CONTRACT.md``, which is the single source of truth.  The
+    bootstrap module docstring in ``codecell/_ipc_bootstrap.py`` repeats a
+    summary and is not authoritative.
 
     Usage::
 

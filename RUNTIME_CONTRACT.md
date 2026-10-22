@@ -10,13 +10,27 @@ arguments, the result codec, `stderr` handling, and process-group cleanup are 0.
 codecell is a **transport** for tool calls and an **owner** of the execution lifecycle.
 Those are different things and the distinction is the whole contract.
 
-| codecell owns (runtime side) | The caller owns (semantic side) |
+### codecell owns (runtime side)
+
+| Responsibility | Status in 0.2.1 |
 |---|---|
-| Spawning, bounding, and killing the execution process | Which callables are exposed to the code — the namespace **is** the capability grant |
-| Framing and ordering of wire messages | Authorization, policy, rate limiting, audit logging |
-| Blocking until a tool call is answered | Actually executing the tool |
-| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | Mapping tool failures to user-facing messages |
-| Protocol versioning, cancellation, `stderr` drain, process-group cleanup, result codec | Retries, caching, and any other semantics above the wire |
+| Spawning the execution process | shipped |
+| Framing and ordering of wire messages | shipped |
+| Blocking until a tool call is answered | shipped |
+| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
+| Protocol versioning | **target — #7**; no version field exists today |
+| Cancellation semantics | **target — #6**; today a timeout kills the direct child only |
+| `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
+| Process-group cleanup | **target — #6**; today grandchildren survive |
+| Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
+
+### The caller owns (semantic side)
+
+- Which callables are exposed to the code — the namespace **is** the capability grant.
+- Authorization, policy, rate limiting, and audit logging.
+- Actually executing the tool.
+- Mapping tool failures to user-facing messages.
+- Retries, caching, and any other semantics above the wire.
 
 Two invariants follow, and both are load-bearing:
 
@@ -43,9 +57,16 @@ If a feature needs any of these, it belongs in the caller, not in a backend.
 ## 3. Wire protocol (v0, as shipped in 0.2.1)
 
 **Transport.** Newline-delimited UTF-8 JSON over the child's `stdin` (main → child) and
-`stdout` (child → main). Exactly one JSON object per line, no pretty-printing. The
-protocol channel is reserved: user `print()` output is redirected to an in-child buffer
-and delivered inside the `done` message, never on the protocol channel.
+`stdout` (child → main). Exactly one JSON object per line, no pretty-printing.
+
+The protocol channel is **not** reserved in 0.2.1. Only `sys.stdout` is rebound for user
+code; `sys.__stdout__` and `sys.stdin` still point at the protocol pipes. Measured: a line
+of junk written to `sys.__stdout__` escapes `execute()` as `JSONDecodeError`, and a forged
+`{"type":"done","stdout":"FORGED","rc":0}` line makes the caller return
+`stdout='FORGED', return_code=0` for a child that is still running (the call returns when
+the child exits or the 5 s reap grace expires). #17 owns the fix — dedicated fds and frame
+validation. Until it lands, `print()` is the only supported output path: it is redirected
+to an in-child buffer and delivered inside `done`.
 
 **Messages.** Four roles, in this order per execution:
 
@@ -58,7 +79,12 @@ and delivered inside the `done` message, never on the protocol channel.
 
 **Ordering and lifecycle rules.**
 
-- One `init` per execution; one `done` per execution unless the process is killed.
+- One `init` per execution. A `done` is expected at the end, but 0.2.1 does **not**
+  guarantee one: the bootstrap catches only `Exception`, so `raise SystemExit(0)` exits
+  without a terminal frame and the parent reports `return_code=0, stdout='', stderr=''`.
+  Measured: a cell that printed `before` and then raised `SystemExit(0)` returned rc 0
+  with the output lost; `SystemExit(7)` returned rc 7, also with the output lost. #17
+  makes the terminal frame a guarantee for `BaseException`.
 - `call` and `result` strictly alternate. The child has no other source of input while
   blocked, so a runtime that does not answer stalls the cell.
 - `done` is produced only by the child finishing. A child killed on timeout sends
@@ -92,6 +118,11 @@ the call site rather than silent values.
 - Non-JSON values (`set`, `bytes`, `datetime`, custom objects) currently fail as shown
   above. #7 defines the codec: deterministic encoding for common types or an explicit,
   documented codec error — never a generic "tool failed" for a successful call.
+- Tool **arguments** are serialized in the child before any frame is sent, so they must be
+  JSON-serializable as well. A non-JSON argument fails *before* the call reaches the
+  caller: `f(x={1, 2})` raises `TypeError ... when serializing dict item 'kwargs'` as a
+  child-side traceback (`return_code=1`), bypassing the `result.error` channel. #7 owns
+  both directions.
 - The returned `stdout`/`stderr` strings are truncated to 64 KiB per stream in the main
   process, after capture.
 
@@ -115,7 +146,10 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 - [ ] Implements the four message roles with the same field names and directions.
 - [ ] Performs a version handshake and rejects an unknown protocol version with an
       actionable error (required from protocol v1).
-- [ ] Keeps the protocol channel dedicated: user `stdout` must not share it.
+- [ ] Keeps the protocol channel dedicated: user code must not be able to reach the
+      protocol fds (no `sys.__stdout__` / `sys.stdin` escape, as in #17).
+- [ ] Guarantees a terminal `done` frame on every exit path, including `SystemExit`
+      and `KeyboardInterrupt` (see #17).
 - [ ] Preserves strict `call` → `result` alternation and blocks the code until answered.
 - [ ] Distinguishes "code finished" (`done`) from "transport died" (EOF/exit) and
       reports both accurately.
