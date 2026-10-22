@@ -7,11 +7,16 @@ and provide their own validation logic and interpreter invocation.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
+from typing import IO, Any
 
 from ._types import CodeResult
 
@@ -37,6 +42,153 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return truncated + "\n... [output truncated]"
+
+
+# ---------------------------------------------------------------------------
+# Process-group lifecycle
+# ---------------------------------------------------------------------------
+# Every child is spawned as the leader of its own process group (POSIX,
+# ``start_new_session=True``) so that a timeout, a caller cancellation, or a
+# crash tears down the whole descendant tree instead of just the direct child.
+#
+# On Windows there are no process groups: only the direct child can be
+# signalled, so grandchildren may survive.  That is a weaker guarantee, and it
+# is the reason POSIX is the supported platform for hard timeout semantics.
+
+_IS_POSIX = os.name == "posix"
+
+# Seconds a descendant gets to exit on SIGTERM before the group is SIGKILLed.
+SIGTERM_GRACE_SECONDS = 1.0
+
+_GROUP_POLL_INTERVAL = 0.02
+_STREAM_CHUNK_CHARS = 8192
+
+
+def _spawn_kwargs() -> dict[str, Any]:
+    """Return ``Popen`` keyword arguments that isolate the child in its own group.
+
+    On POSIX this requests a new session, which makes the child a process-group
+    leader (``pgid == pid``); that group is what
+    :func:`_terminate_process_group` signals.  On Windows nothing can be
+    requested here, so the child shares the caller's group.
+    """
+    if _IS_POSIX:
+        return {"start_new_session": True}
+    return {}
+
+
+def _signal_group(proc: subprocess.Popen[Any], sig: int) -> None:
+    """Send *sig* to the child's process group, or to the child on Windows."""
+    if _IS_POSIX:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, sig)
+        return
+    with contextlib.suppress(OSError, ValueError):
+        proc.send_signal(sig)
+
+
+def _group_alive(proc: subprocess.Popen[Any]) -> bool:
+    """Whether any process of the child's process group still exists."""
+    if not _IS_POSIX:
+        return proc.poll() is None
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_group(
+    proc: subprocess.Popen[Any], grace: float = SIGTERM_GRACE_SECONDS
+) -> None:
+    """Kill the child's whole process group: SIGTERM, grace period, then SIGKILL.
+
+    Safe to call on an already-exited child: once the group is empty this is a
+    no-op.  Any process the child left behind is cleaned up, including
+    grandchildren that outlived it.
+    """
+    if proc.poll() is None or _group_alive(proc):
+        _signal_group(proc, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            # Reap the leader first: its zombie would otherwise keep the group
+            # non-empty and defeat the early exit below.
+            proc.poll()
+            if not _group_alive(proc):
+                break
+            time.sleep(_GROUP_POLL_INTERVAL)
+        else:
+            _signal_group(proc, signal.SIGKILL)
+
+    if proc.poll() is None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+
+
+def _read_stream(stream: IO[str], sink: list[str]) -> None:
+    """Drain *stream* into *sink*, keeping a bounded amount of output.
+
+    Draining must never stop early: a child that keeps writing would block as
+    soon as the OS pipe buffer fills.  Output beyond ``MAX_OUTPUT_BYTES`` plus
+    one chunk is discarded rather than buffered, so a chatty child cannot
+    exhaust the caller's memory.  The extra chunk matters: :func:`truncate`
+    needs to see that the output was clipped in order to append its marker.
+    """
+    limit = MAX_OUTPUT_BYTES + _STREAM_CHUNK_CHARS
+    kept = 0
+    try:
+        while True:
+            chunk = stream.read(_STREAM_CHUNK_CHARS)
+            if not chunk:
+                return
+            if kept < limit:
+                sink.append(chunk)
+                kept += len(chunk)
+    except (OSError, ValueError):
+        return
+
+
+def _collect_output(proc: subprocess.Popen[Any], timeout: float | None) -> tuple[str, str, bool]:
+    """Wait for the child to exit while draining its output pipes.
+
+    Waiting on the process rather than on the pipes is what makes the timeout
+    reliable: a descendant that inherits ``stdout``/``stderr`` keeps the pipe
+    open after the child is gone, so read-until-EOF would block.
+
+    Args:
+        proc: Child process, already spawned with :func:`_spawn_kwargs`.
+        timeout: Maximum wall-clock seconds, or ``None`` for no limit.
+
+    Returns:
+        ``(stdout, stderr, timed_out)``.
+    """
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    readers = [
+        threading.Thread(target=_read_stream, args=(proc.stdout, stdout_chunks), daemon=True),
+        threading.Thread(target=_read_stream, args=(proc.stderr, stderr_chunks), daemon=True),
+    ]
+    for thread in readers:
+        thread.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+    # Descendants that outlive the child are outside the contract: clear the
+    # group so nothing survives ``execute()`` and the reader threads hit EOF.
+    _terminate_process_group(proc)
+    for thread in readers:
+        thread.join(timeout=SIGTERM_GRACE_SECONDS)
+
+    return "".join(stdout_chunks), "".join(stderr_chunks), timed_out
 
 
 class Validator(ABC):
@@ -150,6 +302,21 @@ class SubprocessRuntime(BaseRuntime):
     in a fresh interpreter process.  Crashes, infinite loops, and
     resource exhaustion cannot affect the calling process.
 
+    Timeout and cancellation semantics:
+
+    - The child is spawned as the leader of its own process group (POSIX), so a
+      timeout, an exception, or a caller cancellation such as
+      ``KeyboardInterrupt`` kills the child **and every descendant it spawned**:
+      SIGTERM, a short grace period, then SIGKILL for anything still alive.
+    - Descendants still running when the code finishes are killed before
+      ``execute()`` returns.  Nothing outlives a call.
+    - Output is drained while the child runs, so a child that writes more than
+      the OS pipe buffer cannot deadlock, and a leftover descendant holding the
+      pipes cannot stall the wait.
+    - Windows has no process groups: only the direct child can be killed there,
+      so its grandchildren may survive.  POSIX is required for the hard
+      guarantee.
+
     Usage::
 
         from codecell import SubprocessRuntime
@@ -188,28 +355,30 @@ class SubprocessRuntime(BaseRuntime):
 
         script = self._build_script(code, namespace)
 
+        # The child leads its own process group (POSIX) so the whole descendant
+        # tree can be torn down if it times out, crashes, or the caller cancels.
+        proc = subprocess.Popen(
+            [*self._validator.interpreter, script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_spawn_kwargs(),
+        )
+
         try:
-            result = subprocess.run(
-                [*self._validator.interpreter, script],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            return CodeResult(
-                stdout=truncate(result.stdout),
-                stderr=truncate(result.stderr),
-                return_code=result.returncode,
-                timed_out=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout
-            stderr = exc.stderr
-            return CodeResult(
-                stdout=truncate(stdout if isinstance(stdout, str) else ""),
-                stderr=truncate(stderr if isinstance(stderr, str) else ""),
-                return_code=-1,
-                timed_out=True,
-            )
+            stdout, stderr, timed_out = _collect_output(proc, timeout)
+        except BaseException:
+            # Caller cancellation (e.g. KeyboardInterrupt) must not leak the
+            # child or any of its descendants.
+            _terminate_process_group(proc)
+            raise
+
+        return CodeResult(
+            stdout=truncate(stdout),
+            stderr=truncate(stderr),
+            return_code=-1 if timed_out else proc.returncode,
+            timed_out=timed_out,
+        )
 
     def _build_script(
         self,
@@ -256,6 +425,12 @@ class IpcSubprocessRuntime(BaseRuntime):
         - Crash isolation (segfault, OOM, infinite loop)
         - No cloudpickle needed for tools
         - Tools retain access to main-process state (connections, env)
+
+    Timeout and cancellation semantics are the same as
+    :class:`SubprocessRuntime`: the child leads its own process group (POSIX), and
+    a timeout, an exception, or ``KeyboardInterrupt`` kills the child together
+    with every descendant it spawned.  On Windows only the direct child can be
+    killed, so grandchildren may survive.
 
     Protocol (JSON lines over stdin/stdout pipe):
 
@@ -314,26 +489,28 @@ class IpcSubprocessRuntime(BaseRuntime):
             for name, fn in namespace.items():
                 tool_docs[name] = getattr(fn, "__doc__", None)
 
-        # Spawn subprocess running the bootstrap script
+        # Spawn subprocess running the bootstrap script.  The child leads its own
+        # process group (POSIX) so its descendants can be killed with it.
         proc = subprocess.Popen(
             [sys.executable, "-m", "codecell._ipc_bootstrap"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **_spawn_kwargs(),
         )
 
         try:
             return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
-        except Exception:
-            proc.kill()
+        except BaseException:
+            # Includes KeyboardInterrupt: never leave the child or its
+            # descendants running when the caller walks away.
+            _terminate_process_group(proc)
             raise
         finally:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # Reap the child and clear anything it left behind, so no process
+            # outlives ``execute()``.
+            _terminate_process_group(proc)
 
     def _dispatch_loop(
         self,
@@ -383,7 +560,9 @@ class IpcSubprocessRuntime(BaseRuntime):
             if deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    proc.kill()
+                    # Kill the group, not just the direct child: a descendant may
+                    # be what is keeping the child (or the pipe) alive.
+                    _terminate_process_group(proc)
                     return CodeResult(
                         stdout="",
                         stderr="",
@@ -397,7 +576,7 @@ class IpcSubprocessRuntime(BaseRuntime):
                 line = line_queue.get(timeout=remaining)
             except queue.Empty:
                 # Timeout
-                proc.kill()
+                _terminate_process_group(proc)
                 return CodeResult(
                     stdout="",
                     stderr="",
