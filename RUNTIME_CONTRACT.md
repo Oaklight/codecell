@@ -20,10 +20,10 @@ Those are different things and the distinction is the whole contract.
 | Framing and ordering of wire messages | shipped; channel handles hardened in #17 (#20), frame integrity is #21 |
 | Terminal frame on every exception-based exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
 | Blocking until a tool call is answered | shipped |
-| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
+| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is drained and returned on every exit path (#5/#14, §3) |
 | Protocol versioning | **target — #7**; no version field exists today |
 | Cancellation semantics | **target — #6**; today a timeout kills the direct child only |
-| `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
+| `stderr` drain | shipped (#5/#14): continuous drain into a bounded buffer, returned on success, crash and timeout |
 | Process-group cleanup | **target — #6**; today grandchildren survive |
 | Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
 
@@ -140,11 +140,13 @@ captured in the child and delivered inside `done`.
 - 0.2.1 has **no message ids and no version field**: concurrent calls from user threads
   interleave and corrupt the stream, and an old caller cannot detect a new child. Treat
   one runtime instance as single-threaded until #7 lands.
-- User `sys.stderr` is **not** redirected and **not** captured. It goes to the OS
-  `stderr` pipe, which 0.2.1 reads only when the child dies without sending `done`. On a
-  normal finish those bytes are **discarded** (measured: `sys.stderr.write('hello')` then
-  `print('ok')` returns `stderr=''`), and a write larger than the pipe buffer stalls the
-  cell until the timeout (#5).
+- User `sys.stderr` is **not** redirected: it goes to the OS `stderr` pipe, which the
+  main process drains continuously from the spawn (#5/#14). The drain is what stops a
+  chatty cell from stalling: writing past the pipe buffer no longer blocks the child,
+  because something is always reading. Captured bytes come back on **every** exit path -
+  normal finish, crash, timeout - bounded to `MAX_OUTPUT_BYTES`, with the child's own
+  traceback (sent inside `done`) appended after the drained text. Bytes the drain could
+  not hand over are marked in the returned string rather than dropped silently.
 
 ## 4. Errors on the wire
 
@@ -170,8 +172,10 @@ the call site rather than silent values.
   caller: `f(x={1, 2})` raises `TypeError ... when serializing dict item 'kwargs'` as a
   child-side traceback (`return_code=1`), bypassing the `result.error` channel. #7 owns
   both directions.
-- The returned `stdout`/`stderr` strings are truncated to 64 KiB per stream in the main
-  process, after capture.
+- The returned `stdout`/`stderr` strings are capped at 64 KiB per stream in the main
+  process. For `stderr` the markers that report loss (`... [output truncated]`,
+  `... [stderr may be incomplete: ...]`, `... [stderr head dropped]`) are counted
+  **inside** that cap, so the result never exceeds it.
 
 ## 6. Failure modes as the caller sees them
 
@@ -233,13 +237,13 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 
 | Change | Issue | Effect on this document |
 |---|---|---|
+| `stderr` drained continuously into a bounded reader | #5 / #14 | §3's "stderr is unread until exit" caveat is gone: capture is bounded, returned on every exit path, and marked when incomplete |
 | Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee. The `/proc/<pid>/fd` reopen vector is explicitly listed as an open residual |
 
 ### Remaining 0.3.0 work
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |

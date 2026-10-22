@@ -323,8 +323,95 @@ class TestStderrCapture:
     def test_slow_reader_marks_output_incomplete(self, monkeypatch):
         """A reader that misses its deadline says so instead of losing bytes quietly."""
         monkeypatch.setattr("codecell._runtime.os", _SlowOs(os))
+        # Shorter than one 0.4 s read, so the reader provably cannot finish.
+        monkeypatch.setattr("codecell._runtime._TEARDOWN_BUDGET", 0.3)
         result = self._unvalidated().execute("import sys; sys.stderr.write('x' * 60_000)")
         assert "may be incomplete" in result.stderr
+
+    def test_writer_that_never_stops_does_not_pin_the_reader(self):
+        """A descendant writing in a loop must not spin the drain thread."""
+        code = (
+            "import subprocess, sys\n"
+            "prog = 'import sys' + chr(10) + \"while True: sys.stderr.write('z' * 4096)\"\n"
+            "p = subprocess.Popen([sys.executable, '-c', prog])\n"
+            "sys.stderr.write(f'pid={p.pid}')\n"
+            "sys.stderr.flush()\n"
+            "while True:\n"
+            "    pass\n"
+        )
+        started = time.monotonic()
+        result = self._unvalidated().execute(code, timeout=1)
+        elapsed = time.monotonic() - started
+        try:
+            assert result.timed_out is True
+            assert elapsed < 3, f"drain kept the call open: {elapsed:.1f}s"
+            leaked = ["pending"]
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                leaked = [t for t in threading.enumerate() if t.name == "codecell-stderr-drain"]
+                if not leaked:
+                    break
+                time.sleep(0.05)
+            assert leaked == [], "drain thread outlived the call"
+        finally:
+            _reap_descendant(result)
+
+    def test_worker_failure_is_reported_not_swallowed(self, monkeypatch):
+        """A dead reader is not a clean EOF, and must not look like one."""
+
+        class BoomSelector:
+            def __init__(self, *args, **kwargs):
+                raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr("codecell._runtime.selectors.DefaultSelector", BoomSelector)
+        result = self._unvalidated().execute("import sys; sys.stderr.write('BOOM-LOST')")
+        assert "the stderr reader failed" in result.stderr
+
+    def test_lingering_child_costs_one_budget(self, monkeypatch):
+        """The reap and the drain join share a deadline instead of stacking."""
+        monkeypatch.setattr("codecell._runtime._TEARDOWN_BUDGET", 0.6)
+        code = (
+            "import threading, time\n"
+            "threading.Thread(target=lambda: time.sleep(30), daemon=False).start()\n"
+            "print('captured')"
+        )
+        started = time.monotonic()
+        result = self._unvalidated().execute(code, timeout=1)
+        elapsed = time.monotonic() - started
+        assert result.stdout.strip() == "captured"
+        assert elapsed < 1.0, f"teardown stacked two budgets: {elapsed:.2f}s"
+
+    def test_dispatch_failure_returns_a_result(self):
+        """A child dying mid-call must not escape as a raw exception."""
+        runtime = IpcSubprocessRuntime(NullValidator("python"))
+
+        def slow_tool() -> str:
+            time.sleep(0.6)
+            return "never"
+
+        code = (
+            "import os, threading\nthreading.Timer(0.2, lambda: os._exit(7)).start()\nslow_tool()"
+        )
+        result = runtime.execute(code, namespace={"slow_tool": slow_tool}, timeout=10)
+        assert "before a result frame" in result.stderr
+        assert result.timed_out is False
+
+    def test_output_never_exceeds_the_cap(self):
+        """The markers live inside the budget, so the cap is a cap."""
+        for code in (
+            "import sys; sys.stderr.write('x' * 200_000_000)",
+            "import sys\nsys.stderr.write('x' * 200_000)\nraise ZeroDivisionError('boom')",
+        ):
+            result = self._unvalidated().execute(code, timeout=60)
+            assert len(result.stderr.encode()) <= MAX_OUTPUT_BYTES
+
+    def test_traceback_larger_than_the_cap_marks_the_dropped_head(self):
+        """When the traceback alone fills the budget, say the head was dropped."""
+        code = "import sys\nsys.stderr.write('visible\\n')\nraise ValueError('boom' * 20000)"
+        result = self._unvalidated().execute(code, timeout=20)
+        assert len(result.stderr.encode()) <= MAX_OUTPUT_BYTES
+        assert "stderr head dropped" in result.stderr
+        assert "ValueError" in result.stderr
 
 
 class TestIpcProtocolChannel:

@@ -13,6 +13,7 @@ import selectors
 import subprocess
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import IO, Any
@@ -52,14 +53,38 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
 
 
 _STDERR_CHUNK_BYTES = 8192
-# How often a blocked reader re-checks its stop flag.  Small enough that a
-# timeout is not delayed by a descendant that still holds the write end.
-_STDERR_POLL_SECONDS = 0.25
+# How often a blocked reader re-checks its stop flag.
+_STDERR_POLL_SECONDS = 0.05
 # Only POSIX pipes are pollable; on Windows ``selectors`` handles sockets.
 _STDERR_POLLABLE = os.name == "posix"
-# One reap budget, shared by the dispatch path and the ``finally`` so a
-# lingering child costs it once instead of twice.
-_REAP_TIMEOUT = 5.0
+# On stop the reader takes a bounded number of extra reads, so bytes already in
+# the pipe are not lost without letting a descendant that keeps writing hold
+# the thread open.  It is a count, not "until nothing is ready", because that
+# condition never becomes true while the descendant runs.
+_STDERR_CATCHUP_READS = 64
+# One teardown budget, shared by the reap and the drain join, so a child that
+# will not die costs this once instead of once per wait site.
+_TEARDOWN_BUDGET = 5.0
+_STDERR_HEAD_DROPPED_MARKER = "\n... [stderr head dropped]\n"
+
+
+def _remaining(deadline: float) -> float:
+    """Seconds left before *deadline*, never negative."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def _clip(text: str, budget: int, marker: str, *, force: bool = False) -> str:
+    """Fit *text* into *budget* UTF-8 bytes, with *marker* inside the budget.
+
+    *force* applies the marker even when the text already fits: the buffer is
+    capped at exactly ``MAX_OUTPUT_BYTES``, so a truncated stream can measure
+    as "within budget" while still having dropped everything past the cap.
+    """
+    encoded = text.encode("utf-8", errors="replace")
+    if not force and len(encoded) <= budget:
+        return text
+    keep = max(budget - len(marker.encode("utf-8")), 0)
+    return encoded[:keep].decode("utf-8", errors="ignore") + marker
 
 
 class _StderrDrain:
@@ -74,11 +99,11 @@ class _StderrDrain:
     read, so closing the stream from another thread waits on that lock instead
     of interrupting the read - which is how a drain becomes a hang.
 
-    On POSIX each iteration polls the descriptor first, so the reader notices
-    :meth:`stop` within one poll interval even when a descendant still holds
-    the write end.  Windows cannot poll a pipe, so there the read blocks and
-    the thread is left to die as a daemon - the same weaker guarantee that
-    process teardown has on that platform.
+    On POSIX the descriptor is polled, so the reader notices :meth:`stop`
+    between reads whatever the writer is doing, including a descendant that
+    never stops writing.  Windows cannot poll a pipe, so there the read blocks
+    and the thread is left to die as a daemon: the guarantees this class
+    documents are POSIX guarantees.
     """
 
     def __init__(self, stream: IO[str], limit: int = MAX_OUTPUT_BYTES) -> None:
@@ -87,7 +112,10 @@ class _StderrDrain:
         self._limit = limit
         self._buffer = bytearray()
         self._truncated = False
+        self._eof = False
+        self._error: str | None = None
         self._stop = threading.Event()
+        self._stopped = False
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._read_loop, name="codecell-stderr-drain", daemon=True
@@ -104,49 +132,59 @@ class _StderrDrain:
         self._thread.start()
 
     def _read_loop(self) -> None:
-        if _STDERR_POLLABLE:
-            self._read_pollable()
-        else:
-            self._read_blocking()
+        # Everything is inside the ``try``: a failure in selector setup, in the
+        # poll, or in the read has to be recorded, because the alternative is a
+        # dead thread that looks exactly like a clean EOF.
+        try:
+            if _STDERR_POLLABLE:
+                self._read_pollable()
+            else:
+                self._read_blocking()
+        except BaseException as exc:  # noqa: BLE001 - recorded, never swallowed
+            self._error = f"{type(exc).__name__}: {exc}"
 
     def _read_pollable(self) -> None:
-        """Read while the descriptor can be polled, so ``stop`` never blocks.
+        """Poll the descriptor, so ``stop`` is honoured between reads.
 
         ``selectors`` rather than ``select``: the parent's read end can land
         above ``FD_SETSIZE`` (1024) in a process holding many descriptors, and
         ``select`` raises ``ValueError`` there - killing the reader while the
         child sits blocked on a full pipe.
         """
-        selector = selectors.DefaultSelector()
-        try:
+        with selectors.DefaultSelector() as selector:
             selector.register(self._fd, selectors.EVENT_READ)
-        except (OSError, ValueError):
-            selector.close()
-            return
-        try:
             while True:
-                # Poll first, honour the stop flag only when nothing is ready:
-                # an empty poll means no bytes are pending, so leaving cannot
-                # drop output the child already wrote (the interpreter flushes
-                # stderr on the way out, after ``done``).
+                if self._stop.is_set():
+                    self._catch_up(selector)
+                    return
                 if not selector.select(_STDERR_POLL_SECONDS):
-                    if self._stop.is_set():
-                        return
                     continue
                 if not self._consume():
                     return
-        finally:
-            selector.close()
+
+    def _catch_up(self, selector: selectors.BaseSelector) -> None:
+        """Read what is already pending, then leave whatever is still coming.
+
+        A descendant that keeps writing makes the descriptor permanently
+        readable, so "read until nothing is ready" would not terminate.
+        """
+        for _ in range(_STDERR_CATCHUP_READS):
+            if not selector.select(0):
+                return
+            if not self._consume():
+                return
 
     def _read_blocking(self) -> None:
         """Non-POSIX fallback: a pipe cannot be polled, so the read blocks.
 
-        Nothing can interrupt it.  A descendant holding the write end keeps the
-        thread blocked until it exits, so this path is best effort - the
-        guarantees this class documents are POSIX guarantees.
+        Nothing here can interrupt it.  A descendant holding the write end keeps
+        this thread blocked until that descendant exits, so ``stop`` reports
+        that the reader did not finish and the result says the output may be
+        short.  This path cannot be exercised on the Linux CI runner.
         """
-        while not self._stop.is_set() and self._consume():
-            pass
+        while self._consume():
+            if self._stop.is_set():
+                return
 
     def _consume(self) -> bool:
         """Read one chunk into the buffer.  ``False`` at EOF or on a dead fd."""
@@ -155,6 +193,7 @@ class _StderrDrain:
         except OSError:
             return False
         if not chunk:
+            self._eof = True
             return False
         with self._lock:
             room = self._limit - len(self._buffer)
@@ -164,66 +203,81 @@ class _StderrDrain:
                 self._truncated = True
         return True
 
-    def stop(self, timeout: float = 2.0) -> bool:
-        """Ask the reader to finish, wait for it, then release the descriptor.
+    def stop(self, timeout: float = 2.0) -> None:
+        """Ask the reader to finish and wait for it, taking at most *timeout*.
 
         The join comes before the close on purpose: closing the stream while
         another thread is inside ``os.read`` on it does not interrupt the read,
-        it invalidates the descriptor.  On POSIX the reader exits within one
-        poll interval even when a descendant still holds the write end; on other
-        platforms it may not, and then the daemon thread and the descriptor are
-        left behind rather than the call blocking.
-
-        Returns whether the reader finished, so the caller can say the output
-        may be short instead of pretending it is complete.
+        it invalidates the descriptor.
         """
+        if self._stopped:
+            return
         self._stop.set()
         self._thread.join(timeout)
-        finished = not self._thread.is_alive()
-        if finished:
+        if not self._thread.is_alive():
             with contextlib.suppress(OSError, ValueError):
                 self._stream.close()
-        return finished
+        self._stopped = True
 
     def captured(self) -> bytes:
         """The captured bytes, at most ``limit``."""
         with self._lock:
             return bytes(self._buffer)
 
+    def incomplete_reason(self) -> str | None:
+        """Why the captured bytes may be short, or ``None`` when they are not.
 
-def _compose_stderr(head: bytes, tail: str, truncated: bool, *, complete: bool = True) -> str:
-    """Compose stderr, appending a marker when part of it was dropped."""
-    text = _compose_stderr_complete(head, tail, truncated)
-    return text if complete else text + _STDERR_INCOMPLETE_MARKER
+        Reported instead of inferred from "the thread is not running": a dead
+        worker and a clean EOF look identical from the outside, and treating
+        them the same is how output disappears without a trace.
+        """
+        if self._error is not None:
+            return f"the stderr reader failed ({self._error})"
+        if not self._eof:
+            return "the stderr reader was still draining"
+        if self._thread.is_alive():
+            return "the stderr reader did not stop"
+        return None
 
 
-def _compose_stderr_complete(head: bytes, tail: str, truncated: bool) -> str:
-    """Combine drained stderr with the traceback the child captured itself.
+def _compose_stderr(
+    head: bytes, tail: str, truncated: bool, *, incomplete: str | None = None
+) -> str:
+    """Compose stderr from the drained bytes and the child's own traceback.
 
-    *tail* is what the child sent in its ``done`` message: the traceback of an
-    exception it caught.  It is the part a reader needs most, so room is reserved
-    for it before the cap is applied.  Appending it after truncation would drop
-    it exactly when the program was noisy enough to be clipped.
-
-    A newline separates the two when the drained output does not end with one, so
-    the traceback never runs into the last line the program wrote.
+    *tail* is what the child sent in its ``done`` frame - the traceback of an
+    exception it caught, which is the part a reader needs most.  Everything
+    stays inside ``MAX_OUTPUT_BYTES``: the markers that report loss are part of
+    the budget, so the cap is a cap rather than a suggestion.
     """
-    clipped = truncated or len(head) > MAX_OUTPUT_BYTES
-    if len(head) > MAX_OUTPUT_BYTES:
-        head = head[:MAX_OUTPUT_BYTES]
-    text = head.decode("utf-8", errors="ignore")
-    if not tail:
-        return text + TRUNCATION_MARKER if clipped else text
+    suffix = "" if incomplete is None else f"\n... [stderr may be incomplete: {incomplete}]"
+    body = _compose_body(head, tail, truncated, MAX_OUTPUT_BYTES - len(suffix.encode("utf-8")))
+    return body + suffix
 
+
+def _compose_body(head: bytes, tail: str, truncated: bool, budget: int) -> str:
+    """Fit drained stderr and the child's traceback into *budget* bytes."""
+    text = head.decode("utf-8", errors="ignore")
+    head_clipped = truncated or len(head) > budget
+
+    if not tail:
+        return _clip(text, budget, TRUNCATION_MARKER, force=head_clipped)
+
+    sep = "" if not text or text.endswith("\n") else "\n"
     tail_bytes = len(tail.encode("utf-8", errors="replace"))
-    if tail_bytes >= MAX_OUTPUT_BYTES:
-        return truncate(tail)
-    room = MAX_OUTPUT_BYTES - tail_bytes - len(TRUNCATION_MARKER) - 1
-    if len(head) > room:
-        text = head[: max(room, 0)].decode("utf-8", errors="ignore") + TRUNCATION_MARKER
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + tail
+    head_room = budget - tail_bytes - len(sep.encode("utf-8"))
+
+    if head_room <= len(TRUNCATION_MARKER.encode("utf-8")):
+        # The traceback alone fills the budget.  Dropping the head is fine; not
+        # saying so is not, because a traceback with no program output above it
+        # reads like a program that printed nothing.
+        spare = budget - len(_STDERR_HEAD_DROPPED_MARKER.encode("utf-8"))
+        return _STDERR_HEAD_DROPPED_MARKER + _clip(tail, spare, TRUNCATION_MARKER)
+
+    head_part = text
+    if head_clipped or len(text.encode("utf-8")) > head_room:
+        head_part = _clip(text, head_room, TRUNCATION_MARKER, force=head_clipped)
+    return head_part + sep + tail
 
 
 class Validator(ABC):
@@ -532,14 +586,46 @@ class IpcSubprocessRuntime(BaseRuntime):
 
         try:
             return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout, drain)
-        except Exception:
+        except BaseException:
+            # Safety net only: failures inside the dispatch loop come back as a
+            # CodeResult.  This covers a failure in teardown itself or an
+            # interrupt in the parent, and must not wait a second time.
             proc.kill()
+            drain.stop(_TEARDOWN_BUDGET)
             raise
-        finally:
-            self._reap(proc, _REAP_TIMEOUT)
-            drain.stop()
 
     def _dispatch_loop(
+        self,
+        proc: subprocess.Popen,
+        code: str,
+        tool_docs: dict[str, str | None],
+        namespace: dict[str, Callable[..., Any]],
+        timeout: float | None,
+        drain: _StderrDrain,
+    ) -> CodeResult:
+        """Dispatch, turning any escaping failure into a result.
+
+        A child that dies mid-call makes ``proc.stdin.write`` raise
+        ``BrokenPipeError``; the caller should get a ``CodeResult`` carrying the
+        stderr captured so far, not a raw exception with the buffer thrown away.
+        ``Exception`` rather than ``BaseException``: an interrupt aimed at the
+        parent should stay an interrupt.
+        """
+        try:
+            return self._dispatch(proc, code, tool_docs, namespace, timeout, drain)
+        except Exception as exc:  # noqa: BLE001 - reported as a result
+            return self._finish(
+                proc,
+                drain,
+                stdout="",
+                return_code=None,
+                timed_out=False,
+                tail=(
+                    f"codecell: the call ended before a result frame: {type(exc).__name__}: {exc}"
+                ),
+            )
+
+    def _dispatch(
         self,
         proc: subprocess.Popen,
         code: str,
@@ -558,7 +644,6 @@ class IpcSubprocessRuntime(BaseRuntime):
         """
         import json
         import queue
-        import time
 
         assert proc.stdin is not None
         assert proc.stdout is not None
@@ -694,17 +779,23 @@ class IpcSubprocessRuntime(BaseRuntime):
 
         ``return_code=None`` means *whatever the process exited with*; otherwise
         the code came from the ``done`` frame.  The child is reaped within
-        ``_REAP_TIMEOUT`` - one shared budget, so a child that sent ``done`` and
+        ``_TEARDOWN_BUDGET`` shared with the drain join - so a child that sent
         then lingers costs that once rather than once per wait site.  The drain
         is joined before its buffer is read: the interpreter flushes stderr on
         the way out, *after* the frame, and those bytes are part of the output.
         """
-        self._reap(proc, _REAP_TIMEOUT)
-        complete = drain.stop()
+        deadline = time.monotonic() + _TEARDOWN_BUDGET
+        self._reap(proc, _remaining(deadline))
+        drain.stop(_remaining(deadline))
         rc = proc.returncode if return_code is None else return_code
         return CodeResult(
             stdout=truncate(stdout),
-            stderr=_compose_stderr(drain.captured(), tail, drain.truncated, complete=complete),
+            stderr=_compose_stderr(
+                drain.captured(),
+                tail,
+                drain.truncated,
+                incomplete=drain.incomplete_reason(),
+            ),
             return_code=rc if rc is not None else -1,
             timed_out=timed_out,
         )
