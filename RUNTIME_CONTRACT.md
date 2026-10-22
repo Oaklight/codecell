@@ -18,7 +18,7 @@ Those are different things and the distinction is the whole contract.
 |---|---|
 | Spawning the execution process | shipped |
 | Framing and ordering of wire messages | shipped; channel handles hardened in #17 (#20), frame integrity is #21 |
-| Terminal frame on every Python exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
+| Terminal frame on every exception-based exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
 | Blocking until a tool call is answered | shipped |
 | Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
 | Protocol versioning | **target — #7**; no version field exists today |
@@ -61,7 +61,11 @@ call. Lifecycle semantics belong to codecell; tool semantics belong to the calle
 
 If a feature needs any of these, it belongs in the caller, not in a backend.
 
-## 3. Wire protocol (v0, as shipped in 0.2.1)
+## 3. Wire protocol (v0, with the #17 channel hardening on master)
+
+Wire format v0 is unchanged since 0.2.1; everything marked *(since #17)* is 0.3.0-dev only.
+The released 0.2.1 tag has plain fds 0/1 as the protocol channel, no terminal frame on
+`SystemExit`, and discarded `stderr`.
 
 **Transport.** Newline-delimited UTF-8 JSON over the child's `stdin` (main → child) and
 `stdout` (child → main). Exactly one JSON object per line, no pretty-printing.
@@ -70,14 +74,31 @@ The protocol channel is **reserved at the fd level** since #17 (#20). The bootst
 duplicates fds 0/1, relocates the duplicates to the first free descriptor at or above a
 limit-derived threshold — `min(256, max(3, RLIMIT_NOFILE // 2))`, which is 256 under a
 normal limit but 4 under `RLIMIT_NOFILE=8` — then points fds 0/1 at `os.devnull` before any
-user code runs. Measured under a normal limit: a forged `done` written through
-`sys.__stdout__`, `io.open(1)`, or `os.write(1, ...)` is discarded, and a cell that closes
-fds 3–5 still returns its output (the channel sits at 256/257 there).
+user code runs. If every candidate in that range is occupied, the bootstrap falls back to
+the original descriptor, i.e. a low fd; `RLIMIT_NOFILE` is the only thing that bounds the
+scan, and the close-fd hazard described below comes back in that degraded mode.
 
-The relocated descriptors are non-inheritable **since #23**. Before it, `os.dup2` kept
-`inheritable=True`, so a grandchild started with `close_fds=False` could write a forged
-`done` to fd 257 — measured on `c2d7dd0`: `stdout='FORGED-BY-GRANDCHILD', rc=0`. With #23
-the same grandchild gets `EBADF` and the real output survives.
+Measured under a normal limit: newline-terminated junk written through `sys.__stdout__`,
+`io.open(1)`, or `os.write(1, ...)` is discarded, and a cell that closes fds 3–5 still
+returns its output (the channel sits at 256/257 there). Discarding is line-based: a write
+without a trailing newline coalesces with the genuine `done` line, which is then dropped, and
+the call ends at EOF with `stdout=''` (§6).
+
+The relocated descriptors are non-inheritable **since #23**: `os.dup2` is called with
+`inheritable=False`, so they do not survive `exec`. Before #23, `os.dup2` kept
+`inheritable=True` and a grandchild started with `close_fds=False` could write a forged
+`done` to fd 257 — measured on `c2d7dd0`: `stdout='FORGED-BY-GRANDCHILD', rc=0`.
+
+`FD_CLOEXEC` stops inheritance, not reopening. A grandchild that can read the parent's
+procfs opens the same descriptor by path:
+
+```python
+open(f"/proc/{os.getppid()}/fd/257", "wb").write(b'{"type":"done",...}\n')
+```
+
+Measured on master after #23: `execute()` returns `stdout='FORGED_VIA_PROC', rc=0`. Nothing
+in the same-uid case prevents it. This is the same-interpreter weakness in another form and
+belongs to #21, not to #23.
 
 That is **hardening, not isolation**. User code shares the interpreter with the writer, so
 frame introspection still reaches it —
@@ -160,8 +181,8 @@ the call site rather than silent values.
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
 | Timeout | `timed_out=True`, `return_code=-1`, empty output |
 | Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
-| `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost, so `os._exit(0)` is indistinguishable from an empty success |
-| Fatal signal | `return_code` is the **negative** signal number (`-9` for `SIGKILL`), not a 0–255 exit status; `stdout` lost |
+| `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost. `os._exit(0)` is byte-identical to an empty cell (`rc=0, stdout=''`), so "finished" cannot be distinguished from "transport died" without a terminal frame |
+| Fatal signal | `return_code` is the **negative** signal number (`-15` `SIGTERM`, `-9` `SIGKILL`), not a 0–255 exit status; `stdout` lost. `SIGHUP` yields `-1`, which collides with the timeout sentinel — disambiguate with `timed_out` |
 | Channel destroyed (the cell closed the relocated fds) | `return_code=1`, bootstrap traceback in `stderr`, `stdout` lost |
 | Malformed frame, newline-terminated | ignored: junk on a protocol fd no longer fails the call (measured: `rc=0`, real output intact) |
 | Malformed frame without a trailing newline | coalesces with the genuine `done` line, which is then dropped; the call ends at EOF with `stdout=''` (measured) |
@@ -179,14 +200,16 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
       actionable error (required from protocol v1).
 - [ ] Makes the protocol channel **unreachable**, not merely hidden. Hiding the fds is not
       enough while executed code shares the interpreter with the writer: #17/#20 closed the
-      obvious handles and #23 made the relocated descriptors non-inheritable, while #21 owns
-      the remaining frame-introspection route.
-- [ ] Guarantees a terminal `done` frame on every Python exit path, including `SystemExit`
-      and `KeyboardInterrupt`, and documents which exits still bypass it (`os._exit`,
-      fatal signals).
+      obvious handles and #23 stopped `exec` inheritance, but frame introspection and
+      reopening `/proc/<pid>/fd/<n>` both still reach the writer. #21 owns that.
+- [ ] Guarantees a terminal `done` frame on every exception-based exit path, including
+      `SystemExit` and `KeyboardInterrupt`, and documents which exits still bypass it
+      (`os._exit`, fatal signals, a destroyed channel).
 - [ ] Preserves strict `call` → `result` alternation and blocks the code until answered.
 - [ ] Distinguishes "code finished" (`done`) from "transport died" (EOF/exit) and
-      reports both accurately.
+      reports both accurately — including `os._exit(0)`, which is byte-identical to an
+      empty success and must either be reported as unknown or documented as
+      indistinguishable.
 - [ ] Implements cancellation as a lifecycle operation with defined semantics for
       in-flight calls, and terminates the whole process/container tree.
 - [ ] Never interprets tool semantics (no filtering, authorization, caching, logging).
@@ -204,16 +227,22 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 - [ ] Documents any capability the channel adds or removes relative to the subprocess
       backend.
 
-## 8. What changes in 0.3.0
+## 8. What changes in this document
+
+### Already shipped on master
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee |
+| Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee. The `/proc/<pid>/fd` reopen vector is explicitly listed as an open residual |
+
+### Remaining 0.3.0 work
+
+| Change | Issue | Effect on this document |
+|---|---|---|
 | `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
-| Frame integrity across a shared interpreter | #21 (0.4.0) | Turns the §3 residual into an enforced guarantee by moving the writer out of the executed process |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |
 
 ## 9. Relation to ToolRegistry
@@ -223,3 +252,9 @@ contract here is what codecell guarantees *to* such a caller: framed, ordered,
 blocking tool calls and an honest execution result. `registry.invoke()` is what the
 caller provides *back*: authorization, logging, execution, and error mapping. Neither
 side reaches across the wire.
+
+### 0.4.0
+
+| Change | Issue | Effect on this document |
+|---|---|---|
+| Frame integrity across a shared interpreter | #21 (0.4.0) | Turns the §3 residuals (frame introspection, `/proc/<pid>/fd` reopen) into an enforced guarantee by moving the writer out of the executed process |
