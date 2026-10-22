@@ -119,6 +119,10 @@ Execute code in a subprocess. The validator provides language identity and code 
 | `BashValidator` | Advisory (regex deny-list); removed in 0.3.0 | Bash |
 | `NullValidator(lang)` | None — trusted code only | Any |
 
+## Documentation
+
+- [RUNTIME_CONTRACT.md](https://github.com/Oaklight/codecell/blob/master/RUNTIME_CONTRACT.md) — the IPC wire protocol, the runtime/caller division of responsibility, and the checklist a new backend must satisfy.
+
 ## License
 
 MIT

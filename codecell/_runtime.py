@@ -255,6 +255,14 @@ class IpcSubprocessRuntime(BaseRuntime):
     Tool execution always happens in the main process — only the
     LLM-generated code runs in the subprocess.
 
+    Contract (see ``RUNTIME_CONTRACT.md``): this runtime is transport
+    only for **tool semantics** — it never filters, authorizes, caches,
+    or logs a tool call; the caller owns that.  It does own the
+    **execution lifecycle**: wire framing and ordering, blocking until
+    a call is answered, stdout capture, output truncation, and killing
+    the child.  Tool arguments are keyword-only in this version, and a
+    non-JSON tool result is reported as a failure (#7).
+
     Benefits over in-process ``exec()``:
         - Crash isolation: a segfault or an uncaught exception cannot take
           down the caller
@@ -264,12 +272,11 @@ class IpcSubprocessRuntime(BaseRuntime):
         - No cloudpickle needed for tools
         - Tools retain access to main-process state (connections, env)
 
-    Protocol (JSON lines over stdin/stdout pipe):
-
-        Main → Sub:  ``{"type": "init", "tools": [...], "code": "..."}``
-        Sub → Main:  ``{"type": "call", "tool": "name", "kwargs": {...}}``
-        Main → Sub:  ``{"type": "result", "value": ...}``
-        Sub → Main:  ``{"type": "done", "stdout": "...", "stderr": "...", "rc": 0}``
+    The wire protocol (``init`` / ``call`` / ``result`` / ``done``), its
+    error semantics, and the backend compliance checklist are specified in
+    ``RUNTIME_CONTRACT.md``, which is the single source of truth.  The
+    bootstrap module docstring in ``codecell/_ipc_bootstrap.py`` repeats a
+    summary and is not authoritative.
 
     Usage::
 
