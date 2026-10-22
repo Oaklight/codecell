@@ -264,6 +264,7 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics are a defined lifecycle operation (§6, §7): group SIGTERM→SIGKILL on POSIX; direct child only on Windows |
 | Continuous `stderr` drain | #5 | §3's `stderr` caveat becomes a guarantee: bounded buffer, returned on normal, timeout, and crash paths |
 | Protocol v1, positional args, codec, `__name__`, call lock | #7 | §3 is v1 with a version field on every frame; §4/§5 define `CodecError` and the tagged codec; concurrency is serialized by the child |
+| Bash backend and namespace stub removal | #8 | One tool-call path remains: `IpcSubprocessRuntime`. `SubprocessRuntime` rejects `namespace` with a clear error; `codecell.bash` no longer exists |
 
 ### Remaining 0.3.0 work
 
