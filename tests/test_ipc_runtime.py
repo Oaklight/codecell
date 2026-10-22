@@ -1,6 +1,7 @@
 """Tests for IpcSubprocessRuntime — bidirectional IPC tool calling."""
 
-import threading
+import os
+import subprocess
 import time
 
 import pytest
@@ -151,8 +152,8 @@ class TestIpcIsolation:
         assert result.stdout.strip() == "alive"
 
 
-class TestStderrDrain:
-    """stderr is drained while the child runs, never after it exits (#5)."""
+class TestStderrCapture:
+    """The child's stderr survives every exit path and never blocks the call (#5)."""
 
     @staticmethod
     def _unvalidated():
@@ -221,9 +222,55 @@ class TestStderrDrain:
         result = runtime.execute("1 / 0")
         assert "ZeroDivisionError" in result.stderr
 
-    def test_no_thread_leak_across_executions(self):
+    def test_traceback_survives_truncated_stderr(self):
+        """A clipped stderr must not cost the reader the traceback."""
+        code = "import sys\nsys.stderr.write('x' * 400_000)\nsys.stderr.flush()\n1 / 0\n"
+        result = self._unvalidated().execute(code, timeout=20)
+        assert TRUNCATION_MARKER in result.stderr
+        assert "ZeroDivisionError" in result.stderr
+        assert len(result.stderr.encode()) <= MAX_OUTPUT_BYTES
+
+    def test_stderr_and_traceback_are_separated(self):
+        """A missing trailing newline must not glue the traceback onto the output."""
+        code = "import sys\nsys.stderr.write('no trailing newline')\nsys.stderr.flush()\n1 / 0\n"
+        result = self._unvalidated().execute(code, timeout=10)
+        assert "no trailing newline\nTraceback" in result.stderr
+
+    @pytest.mark.skipif(
+        not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd to count open fds"
+    )
+    def test_no_fd_leak_across_executions(self):
+        """The stderr temp file is closed on every path, timeouts included."""
+        before = len(os.listdir("/proc/self/fd"))
         runtime = self._unvalidated()
         for _ in range(5):
             runtime.execute("import sys; sys.stderr.write('z' * 200_000)", timeout=10)
-        leaked = [t for t in threading.enumerate() if t.name == "codecell-stderr-drain"]
-        assert leaked == []
+        runtime.execute("import sys\nwhile True:\n    pass", timeout=1)
+        assert len(os.listdir("/proc/self/fd")) <= before
+
+    def test_timeout_returns_while_a_descendant_holds_stderr(self):
+        """The blocking case from review: a descendant keeps the stderr fd open.
+
+        With a pipe this waits on a read that only ends when every holder of the
+        write end is gone.  The child's own cleanup is #6's job; what is pinned
+        here is that ``execute()`` returns on schedule regardless.
+        """
+        code = (
+            "import subprocess, sys\n"
+            "sys.stderr.write('spawned')\n"
+            "sys.stderr.flush()\n"
+            "subprocess.Popen(['sleep', '47'])\n"
+            "while True:\n"
+            "    pass\n"
+        )
+        try:
+            started = time.monotonic()
+            result = self._unvalidated().execute(code, timeout=1)
+            elapsed = time.monotonic() - started
+            assert result.timed_out is True
+            assert elapsed < 5, f"call waited on the descendant: {elapsed:.1f}s"
+            assert "spawned" in result.stderr
+        finally:
+            # This branch predates the process-group teardown in #6, so the
+            # descendant is ours to reap.
+            subprocess.run(["pkill", "-f", "sleep 47"], capture_output=True, check=False)
