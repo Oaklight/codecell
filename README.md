@@ -4,7 +4,9 @@ Stateless, subprocess-isolated code execution for LLM agents. Zero dependencies.
 
 > Unlike a Jupyter cell, there's no shared kernel — each call runs in a fresh subprocess with only the tools you inject.
 
-**Scope:** codecell is intentionally limited to sandboxed code evaluation — safe computation and namespace-based tool invocation. It is not a full runtime or a general-purpose execution engine. Features like stateful sessions, IPC-based tool calling, and container isolation may be added in future versions.
+**Scope:** codecell is a small, stateless execution kernel: run one code string in a fresh subprocess, optionally expose callables as tools, and return structured output. It is not a sandbox. Read [THREAT_MODEL.md](THREAT_MODEL.md) before executing code you would not run yourself.
+
+> **Security model:** codecell isolates crashes, not adversaries. A child process inherits your uid, filesystem, network, and environment; `PythonValidator` is an advisory AST check, not a boundary. Container-based isolation is targeted for 0.4.0, and only a container backend may be described as untrusted-code isolation.
 
 ## Quick start
 
@@ -19,9 +21,9 @@ print(result.stdout)  # "3\n"
 
 ## Languages
 
-### Python (sandboxed)
+### Python (AST-checked, advisory)
 
-AST-validated — blocks file I/O, network, command execution, dynamic imports. Only safe computation modules allowed.
+`PythonValidator` walks the AST and rejects imports outside an allow-list, blocked built-in calls, and a small set of `os.*` attributes. That catches accidents and keeps obviously destructive code out of the agent's loop, but it is **not** a security boundary: `import io; io.open('/etc/hostname').read()`, `getattr(__builtins__, 'open')(...)`, and `__subclasses__` traversal all execute. The reproduced list lives in [THREAT_MODEL.md](THREAT_MODEL.md#71-pythonvalidator-ast-allow-list).
 
 ```python
 from codecell import SubprocessRuntime
@@ -29,16 +31,16 @@ from codecell.python import PythonValidator
 
 py = SubprocessRuntime(PythonValidator())
 
-# Safe computation works
+# Computation works
 py.execute("import math; print(math.sqrt(16))")
 
-# Dangerous code is rejected before execution
+# Code blocked by the allow-list, not by isolation
 py.execute("import os; os.system('rm -rf /')")  # raises ValueError
 ```
 
-### Bash (deny-list)
+### Bash (deny-list, being removed)
 
-Regex-based deny list blocks known-dangerous patterns. **Not a sandbox** — reduces risk but cannot guarantee safety.
+Regex-based deny list blocks known-dangerous patterns. **Not a sandbox** — reduces risk but cannot guarantee safety, and quoting defeats it (`su''do id` passes). The backend has no consumer and is removed in 0.3.0; shell execution policy belongs to [`bashtool`](https://github.com/Oaklight/bashtool).
 
 ```python
 from codecell import SubprocessRuntime
@@ -57,6 +59,18 @@ from codecell import SubprocessRuntime, NullValidator
 unsafe = SubprocessRuntime(NullValidator("python"))
 unsafe.execute("import os; print(os.getpid())")  # runs without validation
 ```
+
+## Security model
+
+Guarantees are per backend and only count when the OS enforces them. Full table, adversary tiers, and the reproduced bypasses: [THREAT_MODEL.md](THREAT_MODEL.md).
+
+| Backend | Isolates | Does not isolate |
+|---------|----------|------------------|
+| `SubprocessRuntime` | Crashes, interpreter state (fresh process), output size (64 KB per stream) | Filesystem, network, environment, uid, resource use, process tree on timeout |
+| `IpcSubprocessRuntime` | Same | Same, and every tool call runs with the main process's full authority |
+| `ContainerRuntime` (0.4.0) | Target: filesystem, network, PIDs, resource limits | — |
+
+`Validator` implementations are advisory: they catch accidents and steer the model's behaviour, and a determined author bypasses them in one line. In PTC the capability boundary is the injected tool namespace plus the process or container the code runs in — never the code check.
 
 ## Namespace injection (Python only)
 
@@ -101,8 +115,8 @@ Execute code in a subprocess. The validator provides language identity and code 
 
 | Validator | Security level | Language |
 |-----------|---------------|----------|
-| `PythonValidator` | Strong (AST analysis) | Python |
-| `BashValidator` | Best-effort (regex deny-list) | Bash |
+| `PythonValidator` | Advisory (AST allow-list, bypassable) | Python |
+| `BashValidator` | Advisory (regex deny-list); removed in 0.3.0 | Bash |
 | `NullValidator(lang)` | None — trusted code only | Any |
 
 ## License
