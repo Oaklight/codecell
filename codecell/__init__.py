@@ -23,15 +23,19 @@ from ._runtime import (
     truncate,
 )
 from ._types import CodeResult
+from ._wire import MAX_TOOL_VALUE_BYTES, PROTOCOL_VERSION, CodecError
 
 __version__ = "0.2.1"
 
 __all__ = [
     "BaseRuntime",
     "CodeResult",
+    "CodecError",
     "IpcSubprocessRuntime",
     "MAX_OUTPUT_BYTES",
+    "MAX_TOOL_VALUE_BYTES",
     "NullValidator",
+    "PROTOCOL_VERSION",
     "SubprocessRuntime",
     "Validator",
     "__version__",

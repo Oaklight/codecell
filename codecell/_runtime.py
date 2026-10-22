@@ -19,6 +19,13 @@ from collections.abc import Callable
 from typing import Any
 
 from ._types import CodeResult
+from ._wire import (
+    MAX_TOOL_VALUE_BYTES,
+    PROTOCOL_VERSION,
+    CodecError,
+    dumps,
+    loads,
+)
 
 # Maximum bytes kept for stdout / stderr to prevent memory exhaustion.
 MAX_OUTPUT_BYTES = 65_536  # 64 KB
@@ -55,6 +62,23 @@ _REAP_SECONDS = 5.0
 def _spawn_kwargs() -> dict[str, Any]:
     """Return Popen kwargs that put the child in its own process group."""
     return {"start_new_session": True} if _IS_POSIX else {}
+
+
+def _bootstrap_command() -> list[str]:
+    """Run the IPC bootstrap from the parent's own package tree.
+
+    ``python -m codecell._ipc_bootstrap`` resolves ``codecell`` from the
+    child's cwd and ``PYTHONPATH``, which can point at a different
+    checkout than the one the parent imported.  Pinning the parent's
+    package root keeps both sides on the same protocol and codec.
+    """
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {package_root!r}); "
+        "from codecell._ipc_bootstrap import main; main()"
+    )
+    return [sys.executable, "-c", code]
 
 
 def _pin_pidfd(pid: int) -> int | None:
@@ -403,7 +427,7 @@ class SubprocessRuntime(BaseRuntime):
             doc = getattr(fn, "__doc__", None) or f"Stub for {name}"
             doc_escaped = json.dumps(doc)
             stubs.append(
-                f"def {name}(**kwargs):\n"
+                f"def {name}(*args, **kwargs):\n"
                 f"    {doc_escaped}\n"
                 f"    raise NotImplementedError("
                 f"'Cannot call {name}() in subprocess mode')\n"
@@ -471,6 +495,9 @@ class IpcSubprocessRuntime(BaseRuntime):
             code: Source code to execute.
             namespace: Mapping of name -> callable.  These are callable
                 from the subprocess code via IPC back to the main process.
+                Arguments and results use the codec in :mod:`codecell._wire`;
+                an unencodable value raises :class:`codecell.CodecError` at
+                the call site.
             timeout: Maximum wall-clock seconds before kill.  ``None`` is
                 unbounded; ``0`` expires immediately.
 
@@ -498,7 +525,7 @@ class IpcSubprocessRuntime(BaseRuntime):
 
         # Spawn subprocess running the bootstrap script
         proc = subprocess.Popen(
-            [sys.executable, "-m", "codecell._ipc_bootstrap"],
+            _bootstrap_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -569,7 +596,9 @@ class IpcSubprocessRuntime(BaseRuntime):
         assert proc.stderr is not None
 
         # Send init message with tool docs for help() support
-        init_msg = json.dumps({"type": "init", "tools": tool_docs, "code": code})
+        init_msg = dumps(
+            {"type": "init", "protocol": PROTOCOL_VERSION, "tools": tool_docs, "code": code}
+        )
         proc.stdin.write(init_msg + "\n")
         proc.stdin.flush()
 
@@ -629,13 +658,25 @@ class IpcSubprocessRuntime(BaseRuntime):
                 )
 
             try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
+                msg = loads(line)
+            except (json.JSONDecodeError, CodecError):
                 # User code or an escaped descendant wrote to the channel.
                 # Ignore garbage rather than failing the whole cell.
                 continue
             if not isinstance(msg, dict):
                 continue
+
+            if msg.get("protocol") != PROTOCOL_VERSION:
+                _terminate_group(proc)
+                return CodeResult(
+                    stdout="",
+                    stderr=truncate(
+                        f"Protocol mismatch: child sent {msg.get('protocol')!r}, "
+                        f"expected {PROTOCOL_VERSION}\n"
+                    ),
+                    return_code=1,
+                    timed_out=False,
+                )
 
             msg_type = msg.get("type")
 
@@ -652,31 +693,49 @@ class IpcSubprocessRuntime(BaseRuntime):
 
             if msg_type == "call":
                 tool_name = msg.get("tool")
+                args = msg.get("args", [])
                 kwargs = msg.get("kwargs", {})
-                if not isinstance(tool_name, str) or not isinstance(kwargs, dict):
+                if (
+                    not isinstance(tool_name, str)
+                    or not isinstance(args, list)
+                    or not isinstance(kwargs, dict)
+                ):
                     continue
 
                 fn = namespace.get(tool_name)
                 if fn is None:
-                    result_msg = json.dumps(
+                    result_msg = dumps(
                         {
                             "type": "result",
+                            "protocol": PROTOCOL_VERSION,
                             "error": f"Unknown tool: {tool_name}",
                         }
                     )
                 else:
                     try:
-                        result = fn(**kwargs)
-                        result_msg = json.dumps(
+                        result = fn(*args, **kwargs)
+                        result_msg = dumps(
                             {
                                 "type": "result",
+                                "protocol": PROTOCOL_VERSION,
                                 "value": result,
+                            },
+                            max_bytes=MAX_TOOL_VALUE_BYTES,
+                        )
+                    except CodecError as exc:
+                        result_msg = dumps(
+                            {
+                                "type": "result",
+                                "protocol": PROTOCOL_VERSION,
+                                "error": str(exc),
+                                "error_kind": "codec",
                             }
                         )
                     except Exception as exc:
-                        result_msg = json.dumps(
+                        result_msg = dumps(
                             {
                                 "type": "result",
+                                "protocol": PROTOCOL_VERSION,
                                 "error": f"{type(exc).__name__}: {exc}",
                             }
                         )
