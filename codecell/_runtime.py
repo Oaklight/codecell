@@ -112,21 +112,25 @@ def _terminate_process_group(
 ) -> None:
     """Reap *proc* and kill whatever it left running in its process group.
 
-    Idempotent, and safe on a child that has already exited: the group is
-    checked before the leader is reaped, so a live group is never signalled
-    through a recycled pid, and signals are never sent to our own group.
+    Idempotent, and safe on an already-reaped child: the group is checked before
+    anything is signalled, so our own group is never touched.  On the normal-exit
+    path the leader has already been reaped by ``communicate()``, which leaves a
+    theoretical pid-reuse race; it is narrowed to the microseconds between that
+    reap and this call, and a signal only goes out if a group with that id still
+    has a live member.
     """
     if _group_alive(proc):
         _signal_group(proc, signal.SIGTERM)
         deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if not _group_alive(proc):
-                break
-            # Reaping the leader is what lets an exited-but-unreaped child stop
-            # counting as a live group member.
-            proc.poll()
+        # Wait on the leader instead of sleeping a fixed interval: it exits
+        # within milliseconds, and sleeping cost ~20 ms on every call.  The
+        # deadline is shared, so a child that ignores SIGTERM is still killed
+        # after one grace period rather than two.
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+        while _group_alive(proc) and time.monotonic() < deadline:
             time.sleep(_GROUP_POLL_INTERVAL)
-        else:
+        if _group_alive(proc):
             _kill_group(proc)
 
     if proc.poll() is None:
@@ -299,12 +303,15 @@ class SubprocessRuntime(BaseRuntime):
         stdout = stderr = ""
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # ``communicate`` raises with whatever it had already read.  Keep it:
+            # the retry below is bounded, so it may be all the output there is.
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
             _terminate_process_group(proc)
-            # ``communicate`` keeps what it has already read, so a retry returns
-            # the partial output.  It is bounded: a process that escaped the
-            # group can hold the pipes open indefinitely.
             with contextlib.suppress(subprocess.TimeoutExpired):
+                # ``communicate`` accumulates across calls, so on success this is
+                # the complete output, including the partial read above.
                 stdout, stderr = proc.communicate(timeout=POST_KILL_DRAIN_SECONDS)
             return CodeResult(
                 stdout=truncate(stdout),
@@ -315,6 +322,11 @@ class SubprocessRuntime(BaseRuntime):
         except BaseException:
             _terminate_process_group(proc)
             raise
+
+        # The child exiting says nothing about what it spawned: a descendant that
+        # does not share our pipes is invisible to ``communicate``, so on the
+        # normal and crash exit paths the tree would otherwise outlive the call.
+        _terminate_process_group(proc)
 
         return CodeResult(
             stdout=truncate(stdout),

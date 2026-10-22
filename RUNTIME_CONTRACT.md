@@ -19,9 +19,9 @@ Those are different things and the distinction is the whole contract.
 | Blocking until a tool call is answered | shipped |
 | Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
 | Protocol versioning | **target — #7**; no version field exists today |
-| Cancellation semantics | **target — #6**; today a timeout kills the direct child only |
+| Cancellation semantics | shipped (#6): a timeout or cancellation kills the child's process group (POSIX); `timeout=0` means "fail immediately" |
 | `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
-| Process-group cleanup | **target — #6**; today grandchildren survive |
+| Process-group cleanup | shipped (#6): descendants are killed on timeout, cancellation, crash, and normal exit (POSIX); a descendant that calls `setsid()` leaves the group and survives |
 | Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
 
 ### The caller owns (semantic side)
@@ -132,12 +132,17 @@ the call site rather than silent values.
 |---|---|
 | Code ran and returned | `return_code=0`, `timed_out=False` |
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
-| Timeout | `timed_out=True`, `return_code=-1`, empty output |
+| Timeout | `timed_out=True`, `return_code=-1`; IPC returns empty output, `SubprocessRuntime` returns what it captured before the deadline |
 | Child died without `done` | `return_code` = child exit status, captured `stderr` only |
 | Tool failed | `return_code=1`, `RuntimeError` traceback in `stderr` |
 
 A caller must treat `timed_out=True` as "the wrapper gave up", not "the work stopped":
-0.2.1 kills only the direct child, so grandchildren survive (#6).
+from 0.3.0 the child's process group is killed (POSIX), so descendants that stayed in it
+are gone. A descendant that called `setsid()` has left the group and survives, and Windows
+has no process groups, so only the direct child dies there (#6).
+
+`timeout=0` means "fail immediately" in both runtimes; only `timeout=None` disables the
+deadline.
 
 ## 7. Backend compliance checklist
 
@@ -175,7 +180,7 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 | Change | Issue | Effect on this document |
 |---|---|---|
 | `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
-| Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
+| Process-group kill on timeout/cancellation | #6 | **shipped**: cancellation is a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |
