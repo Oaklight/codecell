@@ -7,16 +7,22 @@ and provide their own validation logic and interpreter invocation.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import sys
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
+from typing import IO, Any
 
 from ._types import CodeResult
 
 # Maximum bytes kept for stdout / stderr to prevent memory exhaustion.
 MAX_OUTPUT_BYTES = 65_536  # 64 KB
+
+# Appended when captured output is clipped, so a caller can tell truncation
+# from a program that genuinely ended there.
+TRUNCATION_MARKER = "\n... [output truncated]"
 
 
 def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
@@ -36,7 +42,80 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
     if len(encoded) <= max_bytes:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return truncated + "\n... [output truncated]"
+    return truncated + TRUNCATION_MARKER
+
+
+class _StderrDrain:
+    """Read a child's stderr in the background into a bounded buffer.
+
+    Draining must not depend on the child exiting.  Once the OS pipe buffer
+    (~64 KiB) fills, a child blocks inside ``write()`` and never sends another
+    protocol message, so a parent that only reads stderr after exit waits for
+    a message that cannot arrive.
+
+    The buffer is capped at *limit* bytes; further output is read and dropped
+    so the child is never blocked by us.  Reading continues after the cap so a
+    flooding child still makes progress.
+    """
+
+    def __init__(self, stream: IO[str], limit: int = MAX_OUTPUT_BYTES) -> None:
+        self._stream = stream
+        self._limit = limit
+        self._buffer = bytearray()
+        self._truncated = False
+        self._captured: bytes | None = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._read_loop, name="codecell-stderr-drain", daemon=True
+        )
+
+    @property
+    def truncated(self) -> bool:
+        """Whether output beyond the buffer cap was dropped."""
+        with self._lock:
+            return self._truncated
+
+    def start(self) -> None:
+        """Begin draining.  Call once, immediately after the spawn."""
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        # ``read1`` returns whatever is available instead of waiting for a
+        # full buffer, so partial output survives a kill.
+        raw: Any = getattr(self._stream, "buffer", self._stream)
+        while True:
+            try:
+                chunk = raw.read1(8192)
+            except (OSError, ValueError):
+                return  # our own close(), or the child went away
+            if not chunk:
+                return
+            data = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8", "replace")
+            with self._lock:
+                room = self._limit - len(self._buffer)
+                if room > 0:
+                    self._buffer.extend(data[:room])
+                if len(data) > max(room, 0):
+                    self._truncated = True
+
+    def stop(self, timeout: float = 2.0) -> bytes:
+        """Stop reading and return the captured bytes (at most ``limit``).
+
+        Blocks at most *timeout* seconds for the reader.  A descendant that
+        inherited the pipe can keep it open after the direct child is gone,
+        so the read end is closed rather than leaving a thread behind.
+        """
+        with self._lock:
+            if self._captured is not None:
+                return self._captured
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            with contextlib.suppress(OSError, ValueError):
+                self._stream.close()
+            self._thread.join(1.0)
+        with self._lock:
+            self._captured = bytes(self._buffer)
+            return self._captured
 
 
 class Validator(ABC):
@@ -322,9 +401,16 @@ class IpcSubprocessRuntime(BaseRuntime):
             stderr=subprocess.PIPE,
             text=True,
         )
+        assert proc.stderr is not None
+
+        # Start draining stderr before the first protocol byte moves.  Reading
+        # it only after exit is the deadlock: a child that fills the pipe
+        # buffer blocks in write() and stops sending protocol messages.
+        drain = _StderrDrain(proc.stderr)
+        drain.start()
 
         try:
-            return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
+            return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout, drain)
         except Exception:
             proc.kill()
             raise
@@ -334,6 +420,7 @@ class IpcSubprocessRuntime(BaseRuntime):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            drain.stop()
 
     def _dispatch_loop(
         self,
@@ -342,11 +429,16 @@ class IpcSubprocessRuntime(BaseRuntime):
         tool_docs: dict[str, str | None],
         namespace: dict[str, Callable[..., Any]],
         timeout: float | None,
+        drain: _StderrDrain,
     ) -> CodeResult:
         """Main-process dispatch loop: forward tool calls, collect results.
 
         Uses a background thread for readline so that timeout can be
         enforced even when the subprocess is blocked (infinite loop).
+
+        Every exit path goes through :meth:`_finish`, so stderr captured by
+        *drain* is returned on success, crash and timeout alike, and the
+        drain thread never outlives the call.
         """
         import json
         import queue
@@ -383,46 +475,34 @@ class IpcSubprocessRuntime(BaseRuntime):
             if deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    proc.kill()
-                    return CodeResult(
-                        stdout="",
-                        stderr="",
-                        return_code=-1,
-                        timed_out=True,
-                    )
+                    return self._timeout_result(proc, drain)
             else:
                 remaining = None
 
             try:
                 line = line_queue.get(timeout=remaining)
             except queue.Empty:
-                # Timeout
-                proc.kill()
-                return CodeResult(
-                    stdout="",
-                    stderr="",
-                    return_code=-1,
-                    timed_out=True,
-                )
+                return self._timeout_result(proc, drain)
 
             if line is None:
-                # Subprocess died unexpectedly
-                stderr = proc.stderr.read()
-                return CodeResult(
-                    stdout="",
-                    stderr=truncate(stderr),
-                    return_code=proc.wait(),
-                    timed_out=False,
-                )
+                # Subprocess died without sending ``done``: a crash, or the
+                # bootstrap exited before the code ran.
+                return self._finish(proc, drain, stdout="", return_code=None, timed_out=False)
 
             msg = json.loads(line)
 
             if msg["type"] == "done":
-                return CodeResult(
-                    stdout=truncate(msg.get("stdout", "")),
-                    stderr=truncate(msg.get("stderr", "")),
+                # ``done`` is sent before the interpreter exits, so the tail of
+                # the child's stderr may still be in the pipe: wait for the
+                # exit (bounded) before collecting.  The traceback the child
+                # captured itself is appended after the drained output.
+                return self._finish(
+                    proc,
+                    drain,
+                    stdout=msg.get("stdout", ""),
                     return_code=msg.get("rc", 0),
                     timed_out=False,
+                    tail=msg.get("stderr", ""),
                 )
 
             if msg["type"] == "call":
@@ -456,3 +536,40 @@ class IpcSubprocessRuntime(BaseRuntime):
 
                 proc.stdin.write(result_msg + "\n")
                 proc.stdin.flush()
+
+    def _timeout_result(self, proc: subprocess.Popen, drain: _StderrDrain) -> CodeResult:
+        """Kill the child and return what was captured, stderr included."""
+        proc.kill()
+        return self._finish(proc, drain, stdout="", return_code=-1, timed_out=True)
+
+    def _finish(
+        self,
+        proc: subprocess.Popen,
+        drain: _StderrDrain,
+        *,
+        stdout: str,
+        return_code: int | None,
+        timed_out: bool,
+        tail: str = "",
+        wait: float = 2.0,
+    ) -> CodeResult:
+        """Collect the child's stderr and build the result.
+
+        ``return_code=None`` means *whatever the process exited with*.  *wait*
+        bounds the wait for exit, so a descendant holding the pipe open cannot
+        hang the call; the stderr captured so far is returned regardless.
+        """
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=wait)
+        drained = drain.stop()
+        text = drained.decode("utf-8", errors="ignore")
+        # ``drained`` is already capped; only the child's own tail can push the
+        # combination over, and it must not be capped twice (two markers).
+        stderr = text + TRUNCATION_MARKER if drain.truncated else truncate(text + tail)
+        rc = proc.returncode if return_code is None else return_code
+        return CodeResult(
+            stdout=truncate(stdout),
+            stderr=stderr,
+            return_code=rc if rc is not None else -1,
+            timed_out=timed_out,
+        )

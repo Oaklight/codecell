@@ -1,9 +1,16 @@
 """Tests for IpcSubprocessRuntime — bidirectional IPC tool calling."""
 
+import threading
+import time
+
 import pytest
 
-from codecell import IpcSubprocessRuntime
+from codecell import MAX_OUTPUT_BYTES, IpcSubprocessRuntime, NullValidator
 from codecell.python import PythonValidator
+
+# Pinned as a literal rather than imported: it is part of the observable
+# output contract, and importing it would make the base tree unimportable.
+TRUNCATION_MARKER = "\n... [output truncated]"
 
 
 @pytest.fixture
@@ -142,3 +149,81 @@ class TestIpcIsolation:
         runtime.execute("while True: pass", timeout=2)
         result = runtime.execute("print('alive')")
         assert result.stdout.strip() == "alive"
+
+
+class TestStderrDrain:
+    """stderr is drained while the child runs, never after it exits (#5)."""
+
+    @staticmethod
+    def _unvalidated():
+        # ``sys`` is not on the PythonValidator allow-list, so the flood
+        # reproductions run with validation off: the deadlock is a property of
+        # the runtime, not of the validator.
+        return IpcSubprocessRuntime(NullValidator("python"))
+
+    def test_400kb_stderr_does_not_deadlock(self):
+        """The reproduced failure: 400 KB of stderr used to hang the call."""
+        result = self._unvalidated().execute(
+            "import sys; sys.stderr.write('x' * 400_000)", timeout=10
+        )
+        assert result.timed_out is False
+        assert result.return_code == 0
+        assert result.stderr.startswith("x")
+        assert TRUNCATION_MARKER in result.stderr
+
+    def test_multi_megabyte_stderr_completes_and_truncates(self):
+        result = self._unvalidated().execute(
+            "import sys; sys.stderr.write('y' * 2_000_000)", timeout=20
+        )
+        assert result.timed_out is False
+        assert result.return_code == 0
+        assert len(result.stderr.encode()) <= MAX_OUTPUT_BYTES + len(TRUNCATION_MARKER)
+        assert result.stderr.endswith(TRUNCATION_MARKER)
+
+    def test_timeout_fires_while_stderr_floods(self):
+        """Timeout enforcement must not depend on stderr volume."""
+        code = (
+            "import sys\nwhile True:\n    sys.stderr.write('x' * 65536)\n    sys.stderr.flush()\n"
+        )
+        started = time.monotonic()
+        result = self._unvalidated().execute(code, timeout=1)
+        elapsed = time.monotonic() - started
+        assert result.timed_out is True
+        assert elapsed < 6, f"timeout did not fire on schedule: {elapsed:.1f}s"
+        assert len(result.stderr) > 0, "stderr written before the kill was lost"
+
+    def test_stderr_returned_on_timeout(self):
+        code = (
+            "import sys\n"
+            "sys.stderr.write('before the hang')\n"
+            "sys.stderr.flush()\n"
+            "while True:\n"
+            "    pass\n"
+        )
+        result = self._unvalidated().execute(code, timeout=1)
+        assert result.timed_out is True
+        assert "before the hang" in result.stderr
+
+    def test_stderr_returned_on_crash(self):
+        code = (
+            "import os, sys\n"
+            "sys.stderr.write('before the crash')\n"
+            "sys.stderr.flush()\n"
+            "os._exit(3)\n"
+        )
+        result = self._unvalidated().execute(code, timeout=10)
+        assert result.timed_out is False
+        assert result.return_code == 3
+        assert "before the crash" in result.stderr
+
+    def test_traceback_still_reported(self, runtime):
+        """The child's own captured traceback must survive the drain."""
+        result = runtime.execute("1 / 0")
+        assert "ZeroDivisionError" in result.stderr
+
+    def test_no_thread_leak_across_executions(self):
+        runtime = self._unvalidated()
+        for _ in range(5):
+            runtime.execute("import sys; sys.stderr.write('z' * 200_000)", timeout=10)
+        leaked = [t for t in threading.enumerate() if t.name == "codecell-stderr-drain"]
+        assert leaked == []
