@@ -1,7 +1,7 @@
 """Tests for IpcSubprocessRuntime — bidirectional IPC tool calling."""
 
-import os
 import subprocess
+import threading
 import time
 
 import pytest
@@ -236,17 +236,35 @@ class TestStderrCapture:
         result = self._unvalidated().execute(code, timeout=10)
         assert "no trailing newline\nTraceback" in result.stderr
 
-    @pytest.mark.skipif(
-        not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd to count open fds"
-    )
-    def test_no_fd_leak_across_executions(self):
-        """The stderr temp file is closed on every path, timeouts included."""
-        before = len(os.listdir("/proc/self/fd"))
+    def test_no_thread_leak_when_a_descendant_holds_stderr(self):
+        """Readers exit on their own, even when a descendant keeps the pipe open.
+
+        ``stop()`` polls instead of blocking, so a reader outlives its call by
+        at most one poll interval - it does not need the group teardown from #6
+        to be collectable.
+        """
         runtime = self._unvalidated()
-        for _ in range(5):
-            runtime.execute("import sys; sys.stderr.write('z' * 200_000)", timeout=10)
-        runtime.execute("import sys\nwhile True:\n    pass", timeout=1)
-        assert len(os.listdir("/proc/self/fd")) <= before
+        try:
+            for _ in range(3):
+                runtime.execute(
+                    "import subprocess, sys\n"
+                    "sys.stderr.write('z' * 200_000)\n"
+                    "sys.stderr.flush()\n"
+                    "subprocess.Popen(['sleep', '48'])\n"
+                    "while True:\n"
+                    "    pass\n",
+                    timeout=1,
+                )
+            leaked = []
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                leaked = [t for t in threading.enumerate() if t.name == "codecell-stderr-drain"]
+                if not leaked:
+                    break
+                time.sleep(0.05)
+            assert leaked == [], f"{len(leaked)} stderr readers outlived their calls"
+        finally:
+            subprocess.run(["pkill", "-f", "sleep 48"], capture_output=True, check=False)
 
     def test_timeout_returns_while_a_descendant_holds_stderr(self):
         """The blocking case from review: a descendant keeps the stderr fd open.

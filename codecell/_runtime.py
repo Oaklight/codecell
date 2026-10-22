@@ -8,9 +8,11 @@ and provide their own validation logic and interpreter invocation.
 from __future__ import annotations
 
 import contextlib
+import os
+import select
 import subprocess
 import sys
-import tempfile
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import IO, Any
@@ -45,19 +47,85 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
     return truncated + TRUNCATION_MARKER
 
 
-def _read_stderr(stderr_file: IO[bytes]) -> bytes:
-    """Read at most ``MAX_OUTPUT_BYTES`` + 1 bytes of the child's stderr.
+_STDERR_CHUNK_BYTES = 8192
+# How often a blocked reader re-checks its stop flag.  Small enough that a
+# timeout is not delayed by a descendant that still holds the write end.
+_STDERR_POLL_SECONDS = 0.25
 
-    The extra byte is how the caller learns the output was clipped without
-    reading - and allocating - the rest.  Reading from a file rather than a pipe
-    is what removes the deadlock: the child never blocks on a full buffer, and a
-    descendant still holding the write end cannot keep us waiting.
+
+class _StderrDrain:
+    """Read the child's stderr from its descriptor into a bounded buffer.
+
+    Reading has to start at spawn, not after exit: once the OS pipe buffer
+    fills, a child blocks inside ``write()`` and stops sending protocol
+    messages, so a parent waiting for the next message waits forever.
+
+    ``os.read`` on the raw descriptor, not ``read``/``read1`` on the
+    ``TextIOWrapper``: the wrapper holds its buffer lock across a blocking
+    read, so closing the stream from another thread waits on that lock instead
+    of interrupting the read - which is how a drain becomes a hang.
+
+    On POSIX each iteration polls the descriptor first, so the reader notices
+    :meth:`stop` within one poll interval even when a descendant still holds
+    the write end.  Windows cannot poll a pipe, so there the read blocks and
+    the thread is left to die as a daemon - the same weaker guarantee that
+    process teardown has on that platform.
     """
-    stderr_file.seek(0)
-    return stderr_file.read(MAX_OUTPUT_BYTES + 1)
+
+    def __init__(self, stream: IO[str], limit: int = MAX_OUTPUT_BYTES) -> None:
+        self._stream = stream  # kept alive: closing it would close the descriptor
+        self._fd = stream.fileno()
+        self._limit = limit
+        self._buffer = bytearray()
+        self._truncated = False
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._read_loop, name="codecell-stderr-drain", daemon=True
+        )
+
+    @property
+    def truncated(self) -> bool:
+        """Whether output beyond the buffer cap was dropped."""
+        with self._lock:
+            return self._truncated
+
+    def start(self) -> None:
+        """Begin draining.  Call once, immediately after the spawn."""
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        pollable = os.name == "posix"
+        while not self._stop.is_set():
+            if pollable:
+                ready, _, _ = select.select([self._fd], [], [], _STDERR_POLL_SECONDS)
+                if not ready:
+                    continue
+            try:
+                chunk = os.read(self._fd, _STDERR_CHUNK_BYTES)
+            except OSError:
+                return  # descriptor closed, or the child went away
+            if not chunk:
+                return  # EOF: every writer is gone
+            with self._lock:
+                room = self._limit - len(self._buffer)
+                if room > 0:
+                    self._buffer.extend(chunk[:room])
+                if len(chunk) > max(room, 0):
+                    self._truncated = True
+
+    def stop(self, timeout: float = 1.0) -> None:
+        """Ask the reader to finish, then wait briefly for it."""
+        self._stop.set()
+        self._thread.join(timeout)
+
+    def captured(self) -> bytes:
+        """The captured bytes, at most ``limit``."""
+        with self._lock:
+            return bytes(self._buffer)
 
 
-def _compose_stderr(head: bytes, tail: str) -> str:
+def _compose_stderr(head: bytes, tail: str, truncated: bool) -> str:
     """Combine drained stderr with the traceback the child captured itself.
 
     *tail* is what the child sent in its ``done`` message: the traceback of an
@@ -68,8 +136,8 @@ def _compose_stderr(head: bytes, tail: str) -> str:
     A newline separates the two when the drained output does not end with one, so
     the traceback never runs into the last line the program wrote.
     """
-    clipped = len(head) > MAX_OUTPUT_BYTES
-    if clipped:
+    clipped = truncated or len(head) > MAX_OUTPUT_BYTES
+    if len(head) > MAX_OUTPUT_BYTES:
         head = head[:MAX_OUTPUT_BYTES]
     text = head.decode("utf-8", errors="ignore")
     if not tail:
@@ -361,33 +429,33 @@ class IpcSubprocessRuntime(BaseRuntime):
             for name, fn in namespace.items():
                 tool_docs[name] = getattr(fn, "__doc__", None)
 
-        # stderr goes to a temporary file rather than a pipe.  A pipe must be
-        # drained while the child runs, and a descendant that inherits the write
-        # end keeps it open after the child is gone - so draining either blocks
-        # the call or needs a thread that can itself hang in close().  A file
-        # cannot fill up: the child never blocks on it, a surviving descendant
-        # holding the fd cannot keep us waiting, and there is no reader thread.
-        with tempfile.TemporaryFile() as stderr_file:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "codecell._ipc_bootstrap"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-                text=True,
-            )
-            try:
-                return self._dispatch_loop(
-                    proc, code, tool_docs, namespace or {}, timeout, stderr_file
-                )
-            except Exception:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "codecell._ipc_bootstrap"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert proc.stderr is not None
+
+        # Start draining before the first protocol byte moves.  Reading stderr
+        # only after exit is the deadlock: a child that fills the pipe buffer
+        # blocks in write() and stops sending protocol messages.
+        drain = _StderrDrain(proc.stderr)
+        drain.start()
+
+        try:
+            return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout, drain)
+        except Exception:
+            proc.kill()
+            raise
+        finally:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+            if proc.poll() is None:
                 proc.kill()
-                raise
-            finally:
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
+                proc.wait()
+            drain.stop()
 
     def _dispatch_loop(
         self,
@@ -396,7 +464,7 @@ class IpcSubprocessRuntime(BaseRuntime):
         tool_docs: dict[str, str | None],
         namespace: dict[str, Callable[..., Any]],
         timeout: float | None,
-        stderr_file: IO[bytes],
+        drain: _StderrDrain,
     ) -> CodeResult:
         """Main-process dispatch loop: forward tool calls, collect results.
 
@@ -440,21 +508,19 @@ class IpcSubprocessRuntime(BaseRuntime):
             if deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return self._timeout_result(proc, stderr_file)
+                    return self._timeout_result(proc, drain)
             else:
                 remaining = None
 
             try:
                 line = line_queue.get(timeout=remaining)
             except queue.Empty:
-                return self._timeout_result(proc, stderr_file)
+                return self._timeout_result(proc, drain)
 
             if line is None:
                 # Subprocess died without sending ``done``: a crash, or the
                 # bootstrap exited before the code ran.
-                return self._finish(
-                    proc, stderr_file, stdout="", return_code=None, timed_out=False
-                )
+                return self._finish(proc, drain, stdout="", return_code=None, timed_out=False)
 
             msg = json.loads(line)
 
@@ -465,7 +531,7 @@ class IpcSubprocessRuntime(BaseRuntime):
                 # captured itself is appended after the drained output.
                 return self._finish(
                     proc,
-                    stderr_file,
+                    drain,
                     stdout=msg.get("stdout", ""),
                     return_code=msg.get("rc", 0),
                     timed_out=False,
@@ -504,15 +570,15 @@ class IpcSubprocessRuntime(BaseRuntime):
                 proc.stdin.write(result_msg + "\n")
                 proc.stdin.flush()
 
-    def _timeout_result(self, proc: subprocess.Popen, stderr_file: IO[bytes]) -> CodeResult:
+    def _timeout_result(self, proc: subprocess.Popen, drain: _StderrDrain) -> CodeResult:
         """Kill the child and return what was captured, stderr included."""
         proc.kill()
-        return self._finish(proc, stderr_file, stdout="", return_code=-1, timed_out=True)
+        return self._finish(proc, drain, stdout="", return_code=-1, timed_out=True)
 
     def _finish(
         self,
         proc: subprocess.Popen,
-        stderr_file: IO[bytes],
+        drain: _StderrDrain,
         *,
         stdout: str,
         return_code: int | None,
@@ -532,7 +598,7 @@ class IpcSubprocessRuntime(BaseRuntime):
         rc = proc.returncode if return_code is None else return_code
         return CodeResult(
             stdout=truncate(stdout),
-            stderr=_compose_stderr(_read_stderr(stderr_file), tail),
+            stderr=_compose_stderr(drain.captured(), tail, drain.truncated),
             return_code=rc if rc is not None else -1,
             timed_out=timed_out,
         )
