@@ -451,8 +451,8 @@ class IpcSubprocessRuntime(BaseRuntime):
     or logs a tool call; the caller owns that.  It does own the
     **execution lifecycle**: wire framing and ordering, blocking until
     a call is answered, stdout capture, output truncation, and killing
-    the child.  Tool arguments are keyword-only in this version, and a
-    non-JSON tool result is reported as a failure (#7).
+    the child.  Tool arguments may be positional or keyword; arguments
+    and results use the codec in :mod:`codecell._wire`.
 
     Benefits over in-process ``exec()``:
         - Crash isolation: a segfault or an uncaught exception cannot take
