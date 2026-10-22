@@ -107,7 +107,7 @@ Execute code in a subprocess. The validator provides language identity and code 
 | Field | Type | Description |
 |-------|------|-------------|
 | `stdout` | `str` | Captured standard output (truncated at 64 KB) |
-| `stderr` | `str` | Captured standard error |
+| `stderr` | `str` | Captured standard error (drained continuously, truncated at 64 KB) |
 | `return_code` | `int` | Exit code, `-1` for timeout |
 | `timed_out` | `bool` | Whether killed by timeout |
 

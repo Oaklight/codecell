@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -21,6 +22,8 @@ from ._types import CodeResult
 
 # Maximum bytes kept for stdout / stderr to prevent memory exhaustion.
 MAX_OUTPUT_BYTES = 65_536  # 64 KB
+
+TRUNCATION_MARKER = "\n... [output truncated]"
 
 
 def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
@@ -40,7 +43,7 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
     if len(encoded) <= max_bytes:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return truncated + "\n... [output truncated]"
+    return truncated + TRUNCATION_MARKER
 
 
 _IS_POSIX = os.name == "posix"
@@ -136,6 +139,52 @@ def _as_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
+
+
+class _StderrDrain:
+    """Continuously drain a child's stderr into a bounded buffer.
+
+    The pipe must be read even when the caller does not want the bytes:
+    once the OS pipe buffer fills, the child blocks in ``write``.  Only
+    the first :data:`MAX_OUTPUT_BYTES` are retained; the remainder is
+    drained and discarded.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._fd = stream.fileno()
+        self._buffer = bytearray()
+        self._total = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="codecell-stderr-drain", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
+
+    def snapshot(self) -> tuple[str, bool]:
+        """Return the retained text and whether later bytes were dropped."""
+        with self._lock:
+            raw = bytes(self._buffer)
+            total = self._total
+        return raw.decode("utf-8", errors="replace"), total > len(raw)
+
+    def _run(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self._fd, 65_536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            with self._lock:
+                self._total += len(chunk)
+                room = MAX_OUTPUT_BYTES - len(self._buffer)
+                if room > 0:
+                    self._buffer.extend(chunk[:room])
 
 
 class Validator(ABC):
@@ -457,9 +506,13 @@ class IpcSubprocessRuntime(BaseRuntime):
             **_spawn_kwargs(),
         )
         pidfd = _pin_pidfd(proc.pid)
+        assert proc.stderr is not None
+        drain = _StderrDrain(proc.stderr)
+        drain.start()
 
+        result: CodeResult | None = None
         try:
-            return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
+            result = self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
         finally:
             # Give the leader a bounded chance to finish its own shutdown
             # (atexit handlers), then tear down anything left in the group.
@@ -473,7 +526,26 @@ class IpcSubprocessRuntime(BaseRuntime):
                 try:
                     _terminate_group(proc)
                 finally:
-                    _close_fd(pidfd)
+                    try:
+                        # Descendants may have inherited stderr; only after
+                        # the group is gone is EOF guaranteed.
+                        drain.join(_REAP_SECONDS)
+                    finally:
+                        _close_fd(pidfd)
+
+        assert result is not None
+        drained, clipped = drain.snapshot()
+        if not drained and not clipped:
+            return result
+        combined = drained + result.stderr
+        if clipped:
+            combined += TRUNCATION_MARKER
+        return CodeResult(
+            stdout=result.stdout,
+            stderr=truncate(combined),
+            return_code=result.return_code,
+            timed_out=result.timed_out,
+        )
 
     def _dispatch_loop(
         self,
@@ -490,7 +562,6 @@ class IpcSubprocessRuntime(BaseRuntime):
         """
         import json
         import queue
-        import threading
         import time
 
         assert proc.stdin is not None
@@ -547,12 +618,12 @@ class IpcSubprocessRuntime(BaseRuntime):
 
             if line is None:
                 # Subprocess died unexpectedly. Tear down any group members
-                # first so a descendant holding stderr cannot block the read.
+                # first so descendants cannot keep stderr open; the drain
+                # thread's buffer is merged in by execute().
                 _terminate_group(proc)
-                stderr = proc.stderr.read()
                 return CodeResult(
                     stdout="",
-                    stderr=truncate(stderr),
+                    stderr="",
                     return_code=proc.returncode if proc.returncode is not None else -1,
                     timed_out=False,
                 )
