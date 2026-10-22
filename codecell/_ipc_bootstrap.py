@@ -20,12 +20,16 @@ Protocol (JSON messages):
 Channel reservation
 -------------------
 
-The protocol uses duplicated descriptors, and file descriptors 0 and 1
-are redirected to ``os.devnull`` before any user code runs.  The obvious
-handles (``sys.stdin``, ``sys.__stdout__``, ``io.open(1)``) therefore
-cannot read or forge protocol frames.  A determined program can still
-enumerate ``/proc/self/fd``; this raises the bar, it is not a security
-boundary.  Real enforcement is the container backend's job.
+The protocol uses duplicated descriptors relocated to high fd numbers,
+and file descriptors 0 and 1 are redirected to ``os.devnull`` before any
+user code runs.  The obvious handles (``sys.stdin``, ``sys.__stdout__``,
+``io.open(1)``) therefore cannot read or forge protocol frames, and
+closing the low fds does not break the channel.
+
+This is hardening, not a same-process security boundary: a determined
+program can enumerate ``/proc/self/fd`` or walk frames to reach the
+writer.  Full enforcement needs a protocol shim in a separate process or
+the container backend.
 
 A ``done`` frame is sent on every Python exit path, including
 ``SystemExit`` and ``KeyboardInterrupt``.  ``os._exit`` and fatal signals
@@ -42,6 +46,27 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+_HIGH_FD_START = 256
+_HIGH_FD_SEARCH = 256
+
+
+def _move_to_high_fd(fd: int) -> int:
+    """Relocate *fd* to a free descriptor above ``_HIGH_FD_START``.
+
+    Predictable low descriptors (3, 4, ...) are easy for user code to
+    close or write to; a high descriptor makes accidental interference
+    unlikely.  Frame introspection can still reach the writer, so this is
+    hardening rather than a boundary.
+    """
+    for candidate in range(_HIGH_FD_START, _HIGH_FD_START + _HIGH_FD_SEARCH):
+        try:
+            os.fstat(candidate)
+        except OSError:
+            os.dup2(fd, candidate)
+            os.close(fd)
+            return candidate
+    return fd
+
 
 def _reserve_protocol_channel() -> tuple[io.TextIOWrapper, io.TextIOWrapper]:
     """Move protocol I/O off fds 0/1 and redirect those fds to devnull.
@@ -50,8 +75,8 @@ def _reserve_protocol_channel() -> tuple[io.TextIOWrapper, io.TextIOWrapper]:
     init line and later frames flow unchanged.  After this returns, user
     code that reaches fd 0/1 reads or writes ``os.devnull``.
     """
-    in_fd = os.dup(0)
-    out_fd = os.dup(1)
+    in_fd = _move_to_high_fd(os.dup(0))
+    out_fd = _move_to_high_fd(os.dup(1))
     devnull = os.open(os.devnull, os.O_RDWR)
     try:
         os.dup2(devnull, 0)
@@ -65,17 +90,33 @@ def _reserve_protocol_channel() -> tuple[io.TextIOWrapper, io.TextIOWrapper]:
 
 
 def _exit_code(exc: BaseException) -> int:
-    """Map a caught ``BaseException`` to a process-style exit code."""
+    """Map a caught ``BaseException`` to a process-style exit code.
+
+    Integer codes are reduced modulo 256 to match how a real process
+    exposes them; ``-1`` therefore becomes 255 and never collides with
+    ``CodeResult``'s timeout sentinel.
+    """
     if isinstance(exc, SystemExit):
         code = exc.code
         if code is None:
             return 0
         if isinstance(code, int):
-            return code
+            return code % 256
         return 1
     if isinstance(exc, KeyboardInterrupt):
         return 130
     return 1
+
+
+class _Capture(io.StringIO):
+    """StringIO whose ``close()`` is a no-op.
+
+    User code may close ``sys.stdout``; the captured output up to that
+    point must still reach the caller.
+    """
+
+    def close(self) -> None:
+        pass
 
 
 def main() -> None:
@@ -105,7 +146,7 @@ def main() -> None:
         tool_docs = {name: None for name in raw_tools}
     code: str = init["code"]
 
-    captured_stdout = io.StringIO()
+    captured_stdout = _Capture()
     sys.stdout = captured_stdout
 
     # Build stub namespace
@@ -140,11 +181,15 @@ def main() -> None:
         exec(compile(code, "<code_execution>", "exec"), exec_globals)
     except BaseException as exc:  # noqa: BLE001 - terminal frame is mandatory
         rc = _exit_code(exc)
-        stderr_text = traceback.format_exc()
+        if isinstance(exc, SystemExit):
+            # A clean exit is not an error; only a string code is a message.
+            stderr_text = f"{exc.code}\n" if isinstance(exc.code, str) else ""
+        else:
+            stderr_text = traceback.format_exc()
     finally:
         try:
             stdout_text = captured_stdout.getvalue()
-        except Exception:  # user code may have closed the capture buffer
+        except Exception:  # pragma: no cover - defensive
             stdout_text = ""
         send_to_main(
             {

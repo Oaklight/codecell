@@ -145,7 +145,7 @@ class TestIpcIsolation:
 
 
 class TestIpcProtocolChannel:
-    """#17: user code cannot reach fds 0/1 or skip the terminal frame."""
+    """#17: harden the protocol channel and always emit a terminal frame."""
 
     def test_sys_dunder_stdout_cannot_forge_done(self, runtime):
         code = (
@@ -153,7 +153,7 @@ class TestIpcProtocolChannel:
             '\'{"type":"done","stdout":"FORGED","rc":0}\\n\')\n'
             "print('real')"
         )
-        result = runtime.execute(code)
+        result = runtime.execute(code, timeout=5)
         assert result.stdout.strip() == "real"
         assert result.return_code == 0
 
@@ -165,7 +165,7 @@ class TestIpcProtocolChannel:
             "f.flush()\n"
             "print('real')"
         )
-        result = runtime.execute(code)
+        result = runtime.execute(code, timeout=5)
         assert result.stdout.strip() == "real"
         assert result.return_code == 0
 
@@ -174,22 +174,53 @@ class TestIpcProtocolChannel:
             return a + b
 
         code = "__builtins__['__import__']('sys').stdin.readline()\nprint(add(a=1, b=2))"
-        result = runtime.execute(code, namespace={"add": add})
+        result = runtime.execute(code, namespace={"add": add}, timeout=5)
         assert result.stdout.strip() == "3"
 
-    def test_system_exit_preserves_output_and_code(self, runtime):
-        result = runtime.execute("print('before'); raise SystemExit(7)")
+    def test_closing_low_fds_does_not_break_done(self, runtime):
+        code = (
+            "os = __builtins__['__import__']('os')\n"
+            "for fd in (3, 4, 5):\n"
+            "    try:\n"
+            "        os.close(fd)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "print('before')"
+        )
+        result = runtime.execute(code, timeout=5)
         assert result.stdout.strip() == "before"
+        assert result.return_code == 0
+
+    def test_closing_stdout_keeps_captured_output(self, runtime):
+        code = "print('before')\n__builtins__['__import__']('sys').stdout.close()"
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 0
+
+    def test_system_exit_preserves_output_and_code(self, runtime):
+        result = runtime.execute("print('before'); raise SystemExit(7)", timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.stderr == ""
         assert result.return_code == 7
         assert result.timed_out is False
 
     def test_system_exit_zero_is_success(self, runtime):
-        result = runtime.execute("print('before'); raise SystemExit(0)")
+        result = runtime.execute("print('before'); raise SystemExit(0)", timeout=5)
         assert result.stdout.strip() == "before"
+        assert result.stderr == ""
         assert result.return_code == 0
 
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [("raise SystemExit(-1)", 255), ("raise SystemExit(300)", 44)],
+    )
+    def test_system_exit_code_matches_process_semantics(self, runtime, code, expected):
+        result = runtime.execute(code, timeout=5)
+        assert result.return_code == expected
+        assert result.timed_out is False
+
     def test_keyboard_interrupt_gets_terminal_frame(self, runtime):
-        result = runtime.execute("print('before'); raise KeyboardInterrupt")
+        result = runtime.execute("print('before'); raise KeyboardInterrupt", timeout=5)
         assert result.stdout.strip() == "before"
         assert result.return_code == 130
         assert result.timed_out is False
