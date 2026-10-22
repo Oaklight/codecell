@@ -2,9 +2,9 @@
 
 Status: describes the protocol **as implemented on `master` after #17**
 (`IpcSubprocessRuntime`, including the channel hardening merged in #20), and the invariants
-every future backend must satisfy. Protocol versioning, positional arguments, the result
-codec and `stderr` handling remain 0.3.0 work (#5, #7); process-group cleanup shipped
-in 0.3.0 (#6). Frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what
+every future backend must satisfy. Protocol versioning, positional arguments and the result
+codec remain 0.3.0 work (#7); process-group cleanup and continuous `stderr` draining shipped
+in 0.3.0 (#5, #6). Frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what
 changes and what this document will then have to say.
 
 ## 1. The division of responsibility
@@ -20,10 +20,10 @@ Those are different things and the distinction is the whole contract.
 | Framing and ordering of wire messages | shipped; channel handles hardened in #17 (#20), frame integrity is #21 |
 | Terminal frame on every exception-based exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
 | Blocking until a tool call is answered | shipped |
-| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
+| Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is drained continuously (§3) |
 | Protocol versioning | **target — #7**; no version field exists today |
 | Cancellation semantics | shipped in 0.3.0 (#6): group SIGTERM→SIGKILL; direct child only on Windows |
-| `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
+| `stderr` drain | shipped in 0.3.0 (#5): bounded continuous drain, returned on every path |
 | Process-group cleanup | shipped in 0.3.0 (#6) on POSIX; direct child only on Windows |
 | Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
 
@@ -140,11 +140,15 @@ captured in the child and delivered inside `done`.
 - 0.2.1 has **no message ids and no version field**: concurrent calls from user threads
   interleave and corrupt the stream, and an old caller cannot detect a new child. Treat
   one runtime instance as single-threaded until #7 lands.
-- User `sys.stderr` is **not** redirected and **not** captured. It goes to the OS
-  `stderr` pipe, which 0.2.1 reads only when the child dies without sending `done`. On a
-  normal finish those bytes are **discarded** (measured: `sys.stderr.write('hello')` then
-  `print('ok')` returns `stderr=''`), and a write larger than the pipe buffer stalls the
-  cell until the timeout (#5).
+- User `sys.stderr` is **not** redirected: writes go to the OS `stderr` pipe. Since #5 the
+  parent drains that pipe continuously into a bounded buffer (the first 64 KiB) and merges it
+  into `CodeResult.stderr` on every path — normal `done`, timeout, and crash/EOF. On a normal
+  finish the drained bytes precede the in-band `done.stderr` (traceback or `SystemExit`
+  message), preserving their relative order. Bytes beyond the buffer are drained and
+  discarded; the returned prefix ends with the truncation marker. Because the pipe is always
+  read, a write of any size (measured: 1 MB) cannot stall the cell. The 0.2.1 behaviour was
+  the opposite: `sys.stderr.write('hello')` then `print('ok')` returned `stderr=''`, and a
+  write larger than the pipe buffer hung until the timeout.
 
 ## 4. Errors on the wire
 
@@ -179,7 +183,7 @@ the call site rather than silent values.
 |---|---|
 | Code ran and returned | `return_code=0`, `timed_out=False` |
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
-| Timeout | `timed_out=True`, `return_code=-1`. `SubprocessRuntime` returns the `stdout`/`stderr` read before the deadline (the IPC `stderr` drain is #5); `IpcSubprocessRuntime` returns empty `stdout`, because captured output only travels in `done` |
+| Timeout | `timed_out=True`, `return_code=-1`. Both runtimes return the `stderr` read before the deadline; `SubprocessRuntime` also returns the partial `stdout`, while `IpcSubprocessRuntime` returns empty `stdout`, because captured output only travels in `done` |
 | Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
 | `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost. `os._exit(0)` is byte-identical to an empty cell (`rc=0, stdout=''`), so "finished" cannot be distinguished from "transport died" without a terminal frame |
 | Fatal signal | `return_code` is the **negative** signal number (`-15` `SIGTERM`, `-9` `SIGKILL`), not a 0–255 exit status; `stdout` lost. `SIGHUP` yields `-1`, which collides with the timeout sentinel — disambiguate with `timed_out` |
@@ -216,6 +220,7 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 - [ ] Never interprets tool semantics (no filtering, authorization, caching, logging).
 - [ ] Bounds every buffer the caller allocates with a ceiling that does not depend on how
       much the executed code writes.
+- [ ] Drains both child streams continuously, so neither pipe can backpressure the child.
 - [ ] Truncates returned output consistently (64 KiB per stream).
 - [ ] Keeps failures and successes distinct in both directions: a tool failure never
       arrives as a value, and a successful value never arrives as a failure (the defect
@@ -236,12 +241,12 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 |---|---|---|
 | Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee. The `/proc/<pid>/fd` reopen vector is explicitly listed as an open residual |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics are a defined lifecycle operation (§6, §7): group SIGTERM→SIGKILL on POSIX; direct child only on Windows |
+| Continuous `stderr` drain | #5 | §3's `stderr` caveat becomes a guarantee: bounded buffer, returned on normal, timeout, and crash paths |
 
 ### Remaining 0.3.0 work
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |
