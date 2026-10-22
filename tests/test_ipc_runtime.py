@@ -142,3 +142,54 @@ class TestIpcIsolation:
         runtime.execute("while True: pass", timeout=2)
         result = runtime.execute("print('alive')")
         assert result.stdout.strip() == "alive"
+
+
+class TestIpcProtocolChannel:
+    """#17: user code cannot reach fds 0/1 or skip the terminal frame."""
+
+    def test_sys_dunder_stdout_cannot_forge_done(self, runtime):
+        code = (
+            "__builtins__['__import__']('sys').__stdout__.write("
+            '\'{"type":"done","stdout":"FORGED","rc":0}\\n\')\n'
+            "print('real')"
+        )
+        result = runtime.execute(code)
+        assert result.stdout.strip() == "real"
+        assert result.return_code == 0
+
+    def test_fd_one_write_cannot_forge_done(self, runtime):
+        code = (
+            "import io\n"
+            "f = io.open(1, 'w', closefd=False)\n"
+            'f.write(\'{"type":"done","stdout":"FORGED","rc":0}\\n\')\n'
+            "f.flush()\n"
+            "print('real')"
+        )
+        result = runtime.execute(code)
+        assert result.stdout.strip() == "real"
+        assert result.return_code == 0
+
+    def test_user_stdin_cannot_steal_frames(self, runtime):
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        code = "__builtins__['__import__']('sys').stdin.readline()\nprint(add(a=1, b=2))"
+        result = runtime.execute(code, namespace={"add": add})
+        assert result.stdout.strip() == "3"
+
+    def test_system_exit_preserves_output_and_code(self, runtime):
+        result = runtime.execute("print('before'); raise SystemExit(7)")
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 7
+        assert result.timed_out is False
+
+    def test_system_exit_zero_is_success(self, runtime):
+        result = runtime.execute("print('before'); raise SystemExit(0)")
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 0
+
+    def test_keyboard_interrupt_gets_terminal_frame(self, runtime):
+        result = runtime.execute("print('before'); raise KeyboardInterrupt")
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 130
+        assert result.timed_out is False
