@@ -255,6 +255,14 @@ class IpcSubprocessRuntime(BaseRuntime):
     Tool execution always happens in the main process — only the
     LLM-generated code runs in the subprocess.
 
+    Contract (see ``RUNTIME_CONTRACT.md``): this runtime is transport
+    only for **tool semantics** — it never filters, authorizes, caches,
+    or logs a tool call; the caller owns that.  It does own the
+    **execution lifecycle**: wire framing and ordering, blocking until
+    a call is answered, stdout capture, output truncation, and killing
+    the child.  Tool arguments are keyword-only in this version, and a
+    non-JSON tool result is reported as a failure (#7).
+
     Benefits over in-process ``exec()``:
         - Crash isolation: a segfault or an uncaught exception cannot take
           down the caller
