@@ -73,7 +73,9 @@ def _move_to_high_fd(fd: int) -> int:
     unlikely.  Frame introspection can still reach the writer, so this is
     hardening rather than a boundary.  The search is bounded by the
     process's ``RLIMIT_NOFILE``; if no candidate is available the original
-    descriptor is kept so the channel still works.
+    descriptor is kept so the channel still works.  The relocated
+    descriptor is non-inheritable, so a spawned grandchild cannot write to
+    the protocol channel through ``close_fds=False``.
     """
     limit = _fd_limit()
     start = min(_HIGH_FD_START, max(3, limit // 2))
@@ -83,7 +85,7 @@ def _move_to_high_fd(fd: int) -> int:
             os.fstat(candidate)
         except OSError:
             try:
-                os.dup2(fd, candidate)
+                os.dup2(fd, candidate, inheritable=False)
             except OSError:
                 continue
             os.close(fd)

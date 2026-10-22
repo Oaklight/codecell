@@ -443,3 +443,14 @@ class TestIpcProtocolChannel:
             assert 3 <= moved < 16
         finally:
             os.close(moved)
+
+    def test_high_fd_relocation_is_non_inheritable(self, monkeypatch):
+        from codecell import _ipc_bootstrap
+
+        monkeypatch.setattr(_ipc_bootstrap, "_fd_limit", lambda: 64)
+        fd = os.dup(1)
+        moved = _ipc_bootstrap._move_to_high_fd(fd)
+        try:
+            assert os.get_inheritable(moved) is False
+        finally:
+            os.close(moved)
