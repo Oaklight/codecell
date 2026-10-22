@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -37,6 +38,16 @@ def test_stderr_is_returned_on_timeout(runtime):
     result = runtime.execute(code, timeout=1)
     assert result.timed_out is True
     assert "before-timeout" in result.stderr
+
+
+def test_timeout_fires_while_stderr_floods(runtime):
+    """Draining must not make timeout enforcement depend on stderr volume."""
+    code = "import sys\nwhile True:\n    sys.stderr.write('y' * 65_536)\n"
+    start = time.monotonic()
+    result = runtime.execute(code, timeout=1)
+    elapsed = time.monotonic() - start
+    assert result.timed_out is True
+    assert elapsed < 3, f"timeout took {elapsed:.2f}s while stderr was flooding"
 
 
 def test_stderr_is_returned_on_crash(runtime):
