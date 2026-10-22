@@ -1,9 +1,11 @@
 # Runtime contract: transport, semantics, and the wire protocol
 
-Status: describes the protocol **as implemented in 0.2.1** (`IpcSubprocessRuntime`), and
-the invariants every future backend must satisfy. Protocol versioning, positional
-arguments, the result codec, `stderr` handling, and process-group cleanup are 0.3.0 work
-(#5, #6, #7); §8 lists what changes and what this document will then have to say.
+Status: describes the protocol **as implemented on `master` after #17**
+(`IpcSubprocessRuntime`, including the channel hardening merged in #20), and the invariants
+every future backend must satisfy. Protocol versioning, positional arguments, the result
+codec, `stderr` handling, and process-group cleanup are still 0.3.0 work (#5, #6, #7);
+frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what changes and what
+this document will then have to say.
 
 ## 1. The division of responsibility
 
@@ -15,7 +17,8 @@ Those are different things and the distinction is the whole contract.
 | Responsibility | Status in 0.2.1 |
 |---|---|
 | Spawning the execution process | shipped |
-| Framing and ordering of wire messages | shipped |
+| Framing and ordering of wire messages | shipped; channel handles hardened in #17 (#20), frame integrity is #21 |
+| Terminal frame on every Python exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
 | Blocking until a tool call is answered | shipped |
 | Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
 | Protocol versioning | **target — #7**; no version field exists today |
@@ -59,14 +62,25 @@ If a feature needs any of these, it belongs in the caller, not in a backend.
 **Transport.** Newline-delimited UTF-8 JSON over the child's `stdin` (main → child) and
 `stdout` (child → main). Exactly one JSON object per line, no pretty-printing.
 
-The protocol channel is **not** reserved in 0.2.1. Only `sys.stdout` is rebound for user
-code; `sys.__stdout__` and `sys.stdin` still point at the protocol pipes. Measured: a line
-of junk written to `sys.__stdout__` escapes `execute()` as `JSONDecodeError`, and a forged
-`{"type":"done","stdout":"FORGED","rc":0}` line makes the caller return
-`stdout='FORGED', return_code=0` for a child that is still running (the call returns when
-the child exits or the 5 s reap grace expires). #17 owns the fix — dedicated fds and frame
-validation. Until it lands, `print()` is the only supported output path: it is redirected
-to an in-child buffer and delivered inside `done`.
+The protocol channel is **reserved at the fd level** since #17 (#20). The bootstrap
+duplicates fds 0/1, relocates the duplicates above fd 256, then points fds 0/1 at
+`os.devnull` before any user code runs. Measured: a forged `done` written through
+`sys.__stdout__`, `io.open(1)`, or `os.write(1, ...)` is discarded; a cell that closes fds
+3–5 still returns its output; and the duplicates are non-inheritable, so a spawned child
+cannot write them either (`os.write(256, ...)` in a grandchild → `EBADF`).
+
+That is **hardening, not isolation**. User code shares the interpreter with the writer, so
+frame introspection still reaches it —
+`sys._getframe().f_back.f_locals['send_to_main']({...})` returns `stdout='FORGED'` today —
+and `/proc/self/fd` still lists the relocated descriptors (measured:
+`['0','1','2','256','257','3']`). The parent ignores malformed frames (§6) but cannot tell
+a forged well-formed `done` from a genuine one. Full enforcement needs the writer in a
+separate process: #21, 0.4.0.
+
+Two consequences worth knowing: a cell that closes the relocated descriptors destroys its
+own channel and is reported as `return_code=1` with a bootstrap traceback and empty output
+(self-DoS, not forgery); and `print()` remains the only supported output path — it is
+captured in the child and delivered inside `done`.
 
 **Messages.** Four roles, in this order per execution:
 
@@ -79,12 +93,12 @@ to an in-child buffer and delivered inside `done`.
 
 **Ordering and lifecycle rules.**
 
-- One `init` per execution. A `done` is expected at the end, but 0.2.1 does **not**
-  guarantee one: the bootstrap catches only `Exception`, so `raise SystemExit(0)` exits
-  without a terminal frame and the parent reports `return_code=0, stdout='', stderr=''`.
-  Measured: a cell that printed `before` and then raised `SystemExit(0)` returned rc 0
-  with the output lost; `SystemExit(7)` returned rc 7, also with the output lost. #17
-  makes the terminal frame a guarantee for `BaseException`.
+- One `init` per execution. A terminal `done` is **guaranteed for every Python exit path**
+  since #17: the bootstrap catches `BaseException`, so `SystemExit` and `KeyboardInterrupt`
+  still produce a frame. Measured: `SystemExit(0)` → `rc=0`, `SystemExit(7)` → `rc=7`,
+  `SystemExit(-1)` → `rc=255`, `SystemExit(300)` → `rc=44`, `SystemExit('bye')` → `rc=1`
+  with `bye` on `stderr`, `KeyboardInterrupt` → `rc=130`; captured output survives in every
+  case. `os._exit` and fatal signals still bypass the frame and surface as EOF (§6).
 - `call` and `result` strictly alternate. The child has no other source of input while
   blocked, so a runtime that does not answer stalls the cell.
 - `done` is produced only by the child finishing. A child killed on timeout sends
@@ -133,7 +147,9 @@ the call site rather than silent values.
 | Code ran and returned | `return_code=0`, `timed_out=False` |
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
 | Timeout | `timed_out=True`, `return_code=-1`, empty output |
-| Child died without `done` | `return_code` = child exit status, captured `stderr` only |
+| Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
+| `os._exit`, a fatal signal, or a destroyed channel | `return_code` = child exit status (`1` if the channel died), `stderr` only; `stdout` may be lost |
+| Malformed frame written to the channel | ignored: junk written to a protocol fd no longer fails the call (measured: `rc=0`, real output intact) |
 | Tool failed | `return_code=1`, `RuntimeError` traceback in `stderr` |
 
 A caller must treat `timed_out=True` as "the wrapper gave up", not "the work stopped":
@@ -146,10 +162,12 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 - [ ] Implements the four message roles with the same field names and directions.
 - [ ] Performs a version handshake and rejects an unknown protocol version with an
       actionable error (required from protocol v1).
-- [ ] Keeps the protocol channel dedicated: user code must not be able to reach the
-      protocol fds (no `sys.__stdout__` / `sys.stdin` escape, as in #17).
-- [ ] Guarantees a terminal `done` frame on every exit path, including `SystemExit`
-      and `KeyboardInterrupt` (see #17).
+- [ ] Makes the protocol channel **unreachable**, not merely hidden. Hiding the fds is not
+      enough while executed code shares the interpreter with the writer: #17/#20 closed the
+      obvious handles, and #21 owns the remaining frame-introspection route.
+- [ ] Guarantees a terminal `done` frame on every Python exit path, including `SystemExit`
+      and `KeyboardInterrupt`, and documents which exits still bypass it (`os._exit`,
+      fatal signals).
 - [ ] Preserves strict `call` → `result` alternation and blocks the code until answered.
 - [ ] Distinguishes "code finished" (`done`) from "transport died" (EOF/exit) and
       reports both accurately.
@@ -174,10 +192,12 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 
 | Change | Issue | Effect on this document |
 |---|---|---|
+| Protocol channel hardening and terminal frame | #17 / #20 | §3 flips from gap to enforced for fd handles and `BaseException`; the #21 residual is stated as a non-guarantee |
 | `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
+| Frame integrity across a shared interpreter | #21 (0.4.0) | Turns the §3 residual into an enforced guarantee by moving the writer out of the executed process |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |
 
 ## 9. Relation to ToolRegistry
