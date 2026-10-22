@@ -1,6 +1,9 @@
 """Tests for IpcSubprocessRuntime — bidirectional IPC tool calling."""
 
-import subprocess
+import contextlib
+import os
+import re
+import signal
 import threading
 import time
 
@@ -152,6 +155,44 @@ class TestIpcIsolation:
         assert result.stdout.strip() == "alive"
 
 
+# A descendant that inherits the stderr write end and outlives the child.  It
+# reports its own pid on stderr, so the test can kill it by pid instead of
+# pattern-matching a process table.  A ``sys.executable`` sleeper rather than
+# the ``sleep`` binary keeps this cross-platform.
+_DESCENDANT = (
+    "import subprocess, sys\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(48)'])\n"
+    "sys.stderr.write(f'pid={p.pid}' + 'z' * 200_000)\n"
+    "sys.stderr.flush()\n"
+    "while True:\n"
+    "    pass\n"
+)
+
+
+class _SlowOs:
+    """``os`` whose ``read`` takes 0.4 s, so the drain is always behind."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def read(self, fd, size):
+        time.sleep(0.4)
+        return self._real.read(fd, size)
+
+
+def _reap_descendant(result) -> None:
+    """Kill the descendant whose pid the cell reported, by pid."""
+    match = re.search(r"pid=(\d+)", result.stderr)
+    if not match:
+        return
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(int(match.group(1)), sig)
+
+
 class TestStderrCapture:
     """The child's stderr survives every exit path and never blocks the call (#5)."""
 
@@ -236,25 +277,20 @@ class TestStderrCapture:
         result = self._unvalidated().execute(code, timeout=10)
         assert "no trailing newline\nTraceback" in result.stderr
 
+    @pytest.mark.skipif(os.name != "posix", reason="descriptor polling is POSIX-only")
     def test_no_thread_leak_when_a_descendant_holds_stderr(self):
         """Readers exit on their own, even when a descendant keeps the pipe open.
 
         ``stop()`` polls instead of blocking, so a reader outlives its call by
         at most one poll interval - it does not need the group teardown from #6
-        to be collectable.
+        to be collectable.  POSIX-only: elsewhere the read cannot be
+        interrupted, which is the documented degradation.
         """
         runtime = self._unvalidated()
+        results = []
         try:
             for _ in range(3):
-                runtime.execute(
-                    "import subprocess, sys\n"
-                    "sys.stderr.write('z' * 200_000)\n"
-                    "sys.stderr.flush()\n"
-                    "subprocess.Popen(['sleep', '48'])\n"
-                    "while True:\n"
-                    "    pass\n",
-                    timeout=1,
-                )
+                results.append(runtime.execute(_DESCENDANT, timeout=1))
             leaked = []
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
@@ -264,7 +300,8 @@ class TestStderrCapture:
                 time.sleep(0.05)
             assert leaked == [], f"{len(leaked)} stderr readers outlived their calls"
         finally:
-            subprocess.run(["pkill", "-f", "sleep 48"], capture_output=True, check=False)
+            for result in results:
+                _reap_descendant(result)
 
     def test_timeout_returns_while_a_descendant_holds_stderr(self):
         """The blocking case from review: a descendant keeps the stderr fd open.
@@ -273,22 +310,136 @@ class TestStderrCapture:
         write end is gone.  The child's own cleanup is #6's job; what is pinned
         here is that ``execute()`` returns on schedule regardless.
         """
-        code = (
-            "import subprocess, sys\n"
-            "sys.stderr.write('spawned')\n"
-            "sys.stderr.flush()\n"
-            "subprocess.Popen(['sleep', '47'])\n"
-            "while True:\n"
-            "    pass\n"
-        )
+        started = time.monotonic()
+        result = self._unvalidated().execute(_DESCENDANT, timeout=1)
+        elapsed = time.monotonic() - started
         try:
-            started = time.monotonic()
-            result = self._unvalidated().execute(code, timeout=1)
-            elapsed = time.monotonic() - started
             assert result.timed_out is True
             assert elapsed < 5, f"call waited on the descendant: {elapsed:.1f}s"
-            assert "spawned" in result.stderr
+            assert "pid=" in result.stderr
         finally:
-            # This branch predates the process-group teardown in #6, so the
-            # descendant is ours to reap.
-            subprocess.run(["pkill", "-f", "sleep 47"], capture_output=True, check=False)
+            _reap_descendant(result)
+
+    def test_slow_reader_marks_output_incomplete(self, monkeypatch):
+        """A reader that misses its deadline says so instead of losing bytes quietly."""
+        monkeypatch.setattr("codecell._runtime.os", _SlowOs(os))
+        result = self._unvalidated().execute("import sys; sys.stderr.write('x' * 60_000)")
+        assert "may be incomplete" in result.stderr
+
+
+class TestIpcProtocolChannel:
+    """#17: harden the protocol channel and always emit a terminal frame."""
+
+    def test_sys_dunder_stdout_cannot_forge_done(self, runtime):
+        code = (
+            "__builtins__['__import__']('sys').__stdout__.write("
+            '\'{"type":"done","stdout":"FORGED","rc":0}\\n\')\n'
+            "print('real')"
+        )
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "real"
+        assert result.return_code == 0
+
+    def test_fd_one_write_cannot_forge_done(self, runtime):
+        code = (
+            "import io\n"
+            "f = io.open(1, 'w', closefd=False)\n"
+            'f.write(\'{"type":"done","stdout":"FORGED","rc":0}\\n\')\n'
+            "f.flush()\n"
+            "print('real')"
+        )
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "real"
+        assert result.return_code == 0
+
+    def test_user_stdin_cannot_steal_frames(self, runtime):
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        code = "__builtins__['__import__']('sys').stdin.readline()\nprint(add(a=1, b=2))"
+        result = runtime.execute(code, namespace={"add": add}, timeout=5)
+        assert result.stdout.strip() == "3"
+
+    def test_closing_low_fds_does_not_break_done(self, runtime):
+        code = (
+            "os = __builtins__['__import__']('os')\n"
+            "for fd in (3, 4, 5):\n"
+            "    try:\n"
+            "        os.close(fd)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "print('before')"
+        )
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 0
+
+    def test_closing_stdout_keeps_captured_output(self, runtime):
+        code = "print('before')\n__builtins__['__import__']('sys').stdout.close()"
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 0
+
+    def test_system_exit_preserves_output_and_code(self, runtime):
+        result = runtime.execute("print('before'); raise SystemExit(7)", timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.stderr == ""
+        assert result.return_code == 7
+        assert result.timed_out is False
+
+    def test_system_exit_zero_is_success(self, runtime):
+        result = runtime.execute("print('before'); raise SystemExit(0)", timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.stderr == ""
+        assert result.return_code == 0
+
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [("raise SystemExit(-1)", 255), ("raise SystemExit(300)", 44)],
+    )
+    def test_system_exit_code_matches_process_semantics(self, runtime, code, expected):
+        result = runtime.execute(code, timeout=5)
+        assert result.return_code == expected
+        assert result.timed_out is False
+
+    def test_keyboard_interrupt_gets_terminal_frame(self, runtime):
+        result = runtime.execute("print('before'); raise KeyboardInterrupt", timeout=5)
+        assert result.stdout.strip() == "before"
+        assert result.return_code == 130
+        assert result.timed_out is False
+
+    def test_garbage_frames_are_ignored(self):
+        from codecell import IpcSubprocessRuntime, NullValidator
+
+        runtime = IpcSubprocessRuntime(NullValidator("python"))
+        code = (
+            "import os\n"
+            "for fd in range(256, 300):\n"
+            "    for payload in (b'garbage-not-json\\n', b'42\\n', b'null\\n'):\n"
+            "        try:\n"
+            "            os.write(fd, payload)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "print('ok')"
+        )
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "ok"
+        assert result.return_code == 0
+        assert result.timed_out is False
+
+    def test_system_exit_object_reports_repr(self, runtime):
+        code = "class C:\n    def __repr__(self):\n        return 'boom'\nraise SystemExit(C())"
+        result = runtime.execute(code, timeout=5)
+        assert result.return_code == 1
+        assert result.stderr.strip() == "boom"
+
+    def test_high_fd_relocation_respects_limit(self, monkeypatch):
+        from codecell import _ipc_bootstrap
+
+        monkeypatch.setattr(_ipc_bootstrap, "_fd_limit", lambda: 16)
+        fd = os.dup(1)
+        moved = _ipc_bootstrap._move_to_high_fd(fd)
+        try:
+            assert 3 <= moved < 16
+        finally:
+            os.close(moved)

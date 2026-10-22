@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-import select
+import selectors
 import subprocess
 import sys
 import threading
@@ -25,6 +25,10 @@ MAX_OUTPUT_BYTES = 65_536  # 64 KB
 # Appended when captured output is clipped, so a caller can tell truncation
 # from a program that genuinely ended there.
 TRUNCATION_MARKER = "\n... [output truncated]"
+# Appended when the reader could not hand over everything before its
+# deadline.  Dropping bytes silently is worse than saying so: a partial
+# traceback with no marker reads like a complete one.
+_STDERR_INCOMPLETE_MARKER = "\n... [stderr may be incomplete: the reader was still draining]"
 
 
 def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
@@ -51,6 +55,11 @@ _STDERR_CHUNK_BYTES = 8192
 # How often a blocked reader re-checks its stop flag.  Small enough that a
 # timeout is not delayed by a descendant that still holds the write end.
 _STDERR_POLL_SECONDS = 0.25
+# Only POSIX pipes are pollable; on Windows ``selectors`` handles sockets.
+_STDERR_POLLABLE = os.name == "posix"
+# One reap budget, shared by the dispatch path and the ``finally`` so a
+# lingering child costs it once instead of twice.
+_REAP_TIMEOUT = 5.0
 
 
 class _StderrDrain:
@@ -95,29 +104,86 @@ class _StderrDrain:
         self._thread.start()
 
     def _read_loop(self) -> None:
-        pollable = os.name == "posix"
-        while not self._stop.is_set():
-            if pollable:
-                ready, _, _ = select.select([self._fd], [], [], _STDERR_POLL_SECONDS)
-                if not ready:
-                    continue
-            try:
-                chunk = os.read(self._fd, _STDERR_CHUNK_BYTES)
-            except OSError:
-                return  # descriptor closed, or the child went away
-            if not chunk:
-                return  # EOF: every writer is gone
-            with self._lock:
-                room = self._limit - len(self._buffer)
-                if room > 0:
-                    self._buffer.extend(chunk[:room])
-                if len(chunk) > max(room, 0):
-                    self._truncated = True
+        if _STDERR_POLLABLE:
+            self._read_pollable()
+        else:
+            self._read_blocking()
 
-    def stop(self, timeout: float = 1.0) -> None:
-        """Ask the reader to finish, then wait briefly for it."""
+    def _read_pollable(self) -> None:
+        """Read while the descriptor can be polled, so ``stop`` never blocks.
+
+        ``selectors`` rather than ``select``: the parent's read end can land
+        above ``FD_SETSIZE`` (1024) in a process holding many descriptors, and
+        ``select`` raises ``ValueError`` there - killing the reader while the
+        child sits blocked on a full pipe.
+        """
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(self._fd, selectors.EVENT_READ)
+        except (OSError, ValueError):
+            selector.close()
+            return
+        try:
+            while True:
+                # Poll first, honour the stop flag only when nothing is ready:
+                # an empty poll means no bytes are pending, so leaving cannot
+                # drop output the child already wrote (the interpreter flushes
+                # stderr on the way out, after ``done``).
+                if not selector.select(_STDERR_POLL_SECONDS):
+                    if self._stop.is_set():
+                        return
+                    continue
+                if not self._consume():
+                    return
+        finally:
+            selector.close()
+
+    def _read_blocking(self) -> None:
+        """Non-POSIX fallback: a pipe cannot be polled, so the read blocks.
+
+        Nothing can interrupt it.  A descendant holding the write end keeps the
+        thread blocked until it exits, so this path is best effort - the
+        guarantees this class documents are POSIX guarantees.
+        """
+        while not self._stop.is_set() and self._consume():
+            pass
+
+    def _consume(self) -> bool:
+        """Read one chunk into the buffer.  ``False`` at EOF or on a dead fd."""
+        try:
+            chunk = os.read(self._fd, _STDERR_CHUNK_BYTES)
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        with self._lock:
+            room = self._limit - len(self._buffer)
+            if room > 0:
+                self._buffer.extend(chunk[:room])
+            if len(chunk) > max(room, 0):
+                self._truncated = True
+        return True
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Ask the reader to finish, wait for it, then release the descriptor.
+
+        The join comes before the close on purpose: closing the stream while
+        another thread is inside ``os.read`` on it does not interrupt the read,
+        it invalidates the descriptor.  On POSIX the reader exits within one
+        poll interval even when a descendant still holds the write end; on other
+        platforms it may not, and then the daemon thread and the descriptor are
+        left behind rather than the call blocking.
+
+        Returns whether the reader finished, so the caller can say the output
+        may be short instead of pretending it is complete.
+        """
         self._stop.set()
         self._thread.join(timeout)
+        finished = not self._thread.is_alive()
+        if finished:
+            with contextlib.suppress(OSError, ValueError):
+                self._stream.close()
+        return finished
 
     def captured(self) -> bytes:
         """The captured bytes, at most ``limit``."""
@@ -125,7 +191,13 @@ class _StderrDrain:
             return bytes(self._buffer)
 
 
-def _compose_stderr(head: bytes, tail: str, truncated: bool) -> str:
+def _compose_stderr(head: bytes, tail: str, truncated: bool, *, complete: bool = True) -> str:
+    """Compose stderr, appending a marker when part of it was dropped."""
+    text = _compose_stderr_complete(head, tail, truncated)
+    return text if complete else text + _STDERR_INCOMPLETE_MARKER
+
+
+def _compose_stderr_complete(head: bytes, tail: str, truncated: bool) -> str:
     """Combine drained stderr with the traceback the child captured itself.
 
     *tail* is what the child sent in its ``done`` message: the traceback of an
@@ -262,8 +334,11 @@ class SubprocessRuntime(BaseRuntime):
     """Execute code in a subprocess for crash isolation.
 
     The code is validated via the provided :class:`Validator`, then run
-    in a fresh interpreter process.  Crashes, infinite loops, and
-    resource exhaustion cannot affect the calling process.
+    in a fresh interpreter process.  That boundary isolates crashes,
+    interpreter state, and caller memory; it does not isolate resource
+    use or adversaries.  Child memory, CPU, and disk use are not
+    limited, output is buffered in full before truncation, and
+    ``timeout=None`` can block indefinitely.  See ``THREAT_MODEL.md``.
 
     Usage::
 
@@ -367,17 +442,28 @@ class IpcSubprocessRuntime(BaseRuntime):
     Tool execution always happens in the main process — only the
     LLM-generated code runs in the subprocess.
 
+    Contract (see ``RUNTIME_CONTRACT.md``): this runtime is transport
+    only for **tool semantics** — it never filters, authorizes, caches,
+    or logs a tool call; the caller owns that.  It does own the
+    **execution lifecycle**: wire framing and ordering, blocking until
+    a call is answered, stdout capture, output truncation, and killing
+    the child.  Tool arguments are keyword-only in this version, and a
+    non-JSON tool result is reported as a failure (#7).
+
     Benefits over in-process ``exec()``:
-        - Crash isolation (segfault, OOM, infinite loop)
+        - Crash isolation: a segfault or an uncaught exception cannot take
+          down the caller
+        - A wall-clock bound on the child when ``timeout`` is passed; with
+          ``timeout=None`` an infinite loop blocks the dispatch loop
+          indefinitely, and an OOM can still reach the host OOM killer
         - No cloudpickle needed for tools
         - Tools retain access to main-process state (connections, env)
 
-    Protocol (JSON lines over stdin/stdout pipe):
-
-        Main → Sub:  ``{"type": "init", "tools": [...], "code": "..."}``
-        Sub → Main:  ``{"type": "call", "tool": "name", "kwargs": {...}}``
-        Main → Sub:  ``{"type": "result", "value": ...}``
-        Sub → Main:  ``{"type": "done", "stdout": "...", "stderr": "...", "rc": 0}``
+    The wire protocol (``init`` / ``call`` / ``result`` / ``done``), its
+    error semantics, and the backend compliance checklist are specified in
+    ``RUNTIME_CONTRACT.md``, which is the single source of truth.  The
+    bootstrap module docstring in ``codecell/_ipc_bootstrap.py`` repeats a
+    summary and is not authoritative.
 
     Usage::
 
@@ -450,11 +536,7 @@ class IpcSubprocessRuntime(BaseRuntime):
             proc.kill()
             raise
         finally:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+            self._reap(proc, _REAP_TIMEOUT)
             drain.stop()
 
     def _dispatch_loop(
@@ -476,7 +558,6 @@ class IpcSubprocessRuntime(BaseRuntime):
         """
         import json
         import queue
-        import threading
         import time
 
         assert proc.stdin is not None
@@ -522,25 +603,39 @@ class IpcSubprocessRuntime(BaseRuntime):
                 # bootstrap exited before the code ran.
                 return self._finish(proc, drain, stdout="", return_code=None, timed_out=False)
 
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                # User code or an escaped descendant wrote to the channel.
+                # Ignore garbage rather than failing the whole cell.
+                continue
+            if not isinstance(msg, dict):
+                continue
 
-            if msg["type"] == "done":
+            msg_type = msg.get("type")
+
+            if msg_type == "done":
+                stdout = msg.get("stdout", "")
+                stderr = msg.get("stderr", "")
+                rc = msg.get("rc", 0)
                 # ``done`` is sent before the interpreter exits, so the tail of
                 # the child's stderr may still be in the pipe: wait for the
-                # exit (bounded) before collecting.  The traceback the child
-                # captured itself is appended after the drained output.
+                # exit (bounded) before collecting, then append the traceback
+                # the child captured itself.
                 return self._finish(
                     proc,
                     drain,
-                    stdout=msg.get("stdout", ""),
-                    return_code=msg.get("rc", 0),
+                    stdout=stdout if isinstance(stdout, str) else str(stdout),
+                    return_code=rc if isinstance(rc, int) else 1,
                     timed_out=False,
-                    tail=msg.get("stderr", ""),
+                    tail=stderr if isinstance(stderr, str) else str(stderr),
                 )
 
-            if msg["type"] == "call":
-                tool_name = msg["tool"]
-                kwargs = msg["kwargs"]
+            if msg_type == "call":
+                tool_name = msg.get("tool")
+                kwargs = msg.get("kwargs", {})
+                if not isinstance(tool_name, str) or not isinstance(kwargs, dict):
+                    continue
 
                 fn = namespace.get(tool_name)
                 if fn is None:
@@ -575,6 +670,16 @@ class IpcSubprocessRuntime(BaseRuntime):
         proc.kill()
         return self._finish(proc, drain, stdout="", return_code=-1, timed_out=True)
 
+    @staticmethod
+    def _reap(proc: subprocess.Popen, budget: float) -> None:
+        """Wait for the child within *budget*, then kill and reap it."""
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=budget)
+        if proc.poll() is None:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=budget)
+
     def _finish(
         self,
         proc: subprocess.Popen,
@@ -584,21 +689,22 @@ class IpcSubprocessRuntime(BaseRuntime):
         return_code: int | None,
         timed_out: bool,
         tail: str = "",
-        wait: float = 2.0,
     ) -> CodeResult:
         """Collect the child's stderr and build the result.
 
-        ``return_code=None`` means *whatever the process exited with*.  *wait*
-        bounds the wait for exit; stderr already written is returned whether or
-        not the child got there, because it is read from a file instead of being
-        waited for on a pipe.
+        ``return_code=None`` means *whatever the process exited with*; otherwise
+        the code came from the ``done`` frame.  The child is reaped within
+        ``_REAP_TIMEOUT`` - one shared budget, so a child that sent ``done`` and
+        then lingers costs that once rather than once per wait site.  The drain
+        is joined before its buffer is read: the interpreter flushes stderr on
+        the way out, *after* the frame, and those bytes are part of the output.
         """
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=wait)
+        self._reap(proc, _REAP_TIMEOUT)
+        complete = drain.stop()
         rc = proc.returncode if return_code is None else return_code
         return CodeResult(
             stdout=truncate(stdout),
-            stderr=_compose_stderr(drain.captured(), tail, drain.truncated),
+            stderr=_compose_stderr(drain.captured(), tail, drain.truncated, complete=complete),
             return_code=rc if rc is not None else -1,
             timed_out=timed_out,
         )
