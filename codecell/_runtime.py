@@ -114,7 +114,10 @@ def _terminate_process_group(
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             # Reap the leader first: its zombie would otherwise keep the group
-            # non-empty and defeat the early exit below.
+            # non-empty and defeat the early exit below.  Reaping makes the pid
+            # reusable in principle, but not while the group still has members:
+            # the kernel keeps a pgid allocated as long as a process references
+            # it, so signalling ``proc.pid`` below cannot reach a recycled group.
             proc.poll()
             if not _group_alive(proc):
                 break
