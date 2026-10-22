@@ -14,7 +14,7 @@ Those are different things and the distinction is the whole contract.
 
 ### codecell owns (runtime side)
 
-| Responsibility | Status in 0.2.1 |
+| Responsibility | Status (0.3.0-dev) |
 |---|---|
 | Spawning the execution process | shipped |
 | Framing and ordering of wire messages | shipped; channel handles hardened in #17 (#20), frame integrity is #21 |
@@ -26,6 +26,10 @@ Those are different things and the distinction is the whole contract.
 | `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
 | Process-group cleanup | **target — #6**; today grandchildren survive |
 | Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
+
+Rows marked *shipped* in the 0.3.0-dev column are **not** in the released 0.2.1: on the
+`v0.2.1` tag, `SystemExit` returns without a terminal frame (`rc=0, stdout=''`), the protocol
+fds are plain 0/1, and `stderr` is discarded.
 
 ### The caller owns (semantic side)
 
@@ -63,11 +67,17 @@ If a feature needs any of these, it belongs in the caller, not in a backend.
 `stdout` (child → main). Exactly one JSON object per line, no pretty-printing.
 
 The protocol channel is **reserved at the fd level** since #17 (#20). The bootstrap
-duplicates fds 0/1, relocates the duplicates above fd 256, then points fds 0/1 at
-`os.devnull` before any user code runs. Measured: a forged `done` written through
-`sys.__stdout__`, `io.open(1)`, or `os.write(1, ...)` is discarded; a cell that closes fds
-3–5 still returns its output; and the duplicates are non-inheritable, so a spawned child
-cannot write them either (`os.write(256, ...)` in a grandchild → `EBADF`).
+duplicates fds 0/1, relocates the duplicates to the first free descriptor at or above a
+limit-derived threshold — `min(256, max(3, RLIMIT_NOFILE // 2))`, which is 256 under a
+normal limit but 4 under `RLIMIT_NOFILE=8` — then points fds 0/1 at `os.devnull` before any
+user code runs. Measured under a normal limit: a forged `done` written through
+`sys.__stdout__`, `io.open(1)`, or `os.write(1, ...)` is discarded, and a cell that closes
+fds 3–5 still returns its output (the channel sits at 256/257 there).
+
+The relocated descriptors are non-inheritable **since #23**. Before it, `os.dup2` kept
+`inheritable=True`, so a grandchild started with `close_fds=False` could write a forged
+`done` to fd 257 — measured on `c2d7dd0`: `stdout='FORGED-BY-GRANDCHILD', rc=0`. With #23
+the same grandchild gets `EBADF` and the real output survives.
 
 That is **hardening, not isolation**. User code shares the interpreter with the writer, so
 frame introspection still reaches it —
@@ -93,12 +103,14 @@ captured in the child and delivered inside `done`.
 
 **Ordering and lifecycle rules.**
 
-- One `init` per execution. A terminal `done` is **guaranteed for every Python exit path**
-  since #17: the bootstrap catches `BaseException`, so `SystemExit` and `KeyboardInterrupt`
-  still produce a frame. Measured: `SystemExit(0)` → `rc=0`, `SystemExit(7)` → `rc=7`,
-  `SystemExit(-1)` → `rc=255`, `SystemExit(300)` → `rc=44`, `SystemExit('bye')` → `rc=1`
-  with `bye` on `stderr`, `KeyboardInterrupt` → `rc=130`; captured output survives in every
-  case. `os._exit` and fatal signals still bypass the frame and surface as EOF (§6).
+- One `init` per execution. A terminal `done` is **guaranteed for every exit that unwinds
+  through the interpreter** since #17: the bootstrap catches `BaseException`, so `SystemExit`
+  and `KeyboardInterrupt` still produce a frame. Measured: `SystemExit(0)` → `rc=0`,
+  `SystemExit(7)` → `rc=7`, `SystemExit(-1)` → `rc=255`, `SystemExit(300)` → `rc=44`,
+  `SystemExit('bye')` → `rc=1` with `bye` on `stderr`, `KeyboardInterrupt` → `rc=130`;
+  captured output survives in every case. Exits that bypass the interpreter are **not**
+  covered: `os._exit(0)` looks exactly like an empty success (`rc=0, stdout=''`), and a
+  fatal signal surfaces as a negative `return_code` (§6).
 - `call` and `result` strictly alternate. The child has no other source of input while
   blocked, so a runtime that does not answer stalls the cell.
 - `done` is produced only by the child finishing. A child killed on timeout sends
@@ -148,8 +160,11 @@ the call site rather than silent values.
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
 | Timeout | `timed_out=True`, `return_code=-1`, empty output |
 | Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
-| `os._exit`, a fatal signal, or a destroyed channel | `return_code` = child exit status (`1` if the channel died), `stderr` only; `stdout` may be lost |
-| Malformed frame written to the channel | ignored: junk written to a protocol fd no longer fails the call (measured: `rc=0`, real output intact) |
+| `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost, so `os._exit(0)` is indistinguishable from an empty success |
+| Fatal signal | `return_code` is the **negative** signal number (`-9` for `SIGKILL`), not a 0–255 exit status; `stdout` lost |
+| Channel destroyed (the cell closed the relocated fds) | `return_code=1`, bootstrap traceback in `stderr`, `stdout` lost |
+| Malformed frame, newline-terminated | ignored: junk on a protocol fd no longer fails the call (measured: `rc=0`, real output intact) |
+| Malformed frame without a trailing newline | coalesces with the genuine `done` line, which is then dropped; the call ends at EOF with `stdout=''` (measured) |
 | Tool failed | `return_code=1`, `RuntimeError` traceback in `stderr` |
 
 A caller must treat `timed_out=True` as "the wrapper gave up", not "the work stopped":
@@ -164,7 +179,8 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
       actionable error (required from protocol v1).
 - [ ] Makes the protocol channel **unreachable**, not merely hidden. Hiding the fds is not
       enough while executed code shares the interpreter with the writer: #17/#20 closed the
-      obvious handles, and #21 owns the remaining frame-introspection route.
+      obvious handles and #23 made the relocated descriptors non-inheritable, while #21 owns
+      the remaining frame-introspection route.
 - [ ] Guarantees a terminal `done` frame on every Python exit path, including `SystemExit`
       and `KeyboardInterrupt`, and documents which exits still bypass it (`os._exit`,
       fatal signals).
@@ -192,7 +208,7 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| Protocol channel hardening and terminal frame | #17 / #20 | §3 flips from gap to enforced for fd handles and `BaseException`; the #21 residual is stated as a non-guarantee |
+| Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee |
 | `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
