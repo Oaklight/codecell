@@ -2,9 +2,9 @@
 
 Stateless, subprocess-isolated code execution for LLM agents. Zero dependencies.
 
-> Unlike a Jupyter cell, there's no shared kernel — each call runs in a fresh subprocess with only the capabilities you explicitly route to it.
+> Unlike a Jupyter cell, there's no shared kernel — each call runs in a fresh subprocess with only the callables you route to it.
 
-**Scope:** codecell is a small, stateless execution kernel: run one code string in a fresh subprocess, optionally expose callables as tools, and return structured output. It is not a sandbox. Read [THREAT_MODEL.md](THREAT_MODEL.md) before executing code you would not run yourself.
+**Scope:** codecell is a small, stateless execution kernel: run one code string in a fresh subprocess, optionally expose callables as tools, and return structured output. It is not a sandbox. Read [THREAT_MODEL.md](https://github.com/Oaklight/codecell/blob/master/THREAT_MODEL.md) before executing code you would not run yourself.
 
 > **Security model:** codecell isolates crashes, not adversaries. A child process inherits your uid, filesystem, network, and environment; `PythonValidator` is an advisory AST check, not a boundary. Container-based isolation is targeted for 0.4.0, and only a container backend may be described as untrusted-code isolation.
 
@@ -23,7 +23,7 @@ print(result.stdout)  # "3\n"
 
 ### Python (AST-checked, advisory)
 
-`PythonValidator` walks the AST and rejects imports outside an allow-list, blocked built-in calls, and a small set of `os.*` attributes. That catches accidents and keeps obviously destructive code out of the agent's loop, but it is **not** a security boundary: `import io; io.open('/etc/hostname').read()`, `getattr(__builtins__, 'open')(...)`, and `__subclasses__` traversal all execute. The reproduced list lives in [THREAT_MODEL.md](THREAT_MODEL.md#71-pythonvalidator-ast-allow-list).
+`PythonValidator` walks the AST and rejects imports outside an allow-list, blocked built-in calls, and a small set of `os.*` attributes. That catches accidents and keeps obviously destructive code out of the agent's loop, but it is **not** a security boundary: `import io; io.open('/etc/hostname').read()`, `getattr(__builtins__, 'open')(...)`, and `__subclasses__` traversal all execute. The reproduced list lives in [THREAT_MODEL.md](https://github.com/Oaklight/codecell/blob/master/THREAT_MODEL.md#71-pythonvalidator-ast-allow-list).
 
 ```python
 from codecell import SubprocessRuntime
@@ -62,7 +62,7 @@ unsafe.execute("import os; print(os.getpid())")  # runs without validation
 
 ## Security model
 
-Guarantees are per backend and only count when the OS enforces them. Full table, adversary tiers, and the reproduced bypasses: [THREAT_MODEL.md](THREAT_MODEL.md).
+Guarantees are per backend and only count when the OS enforces them. Full table, adversary tiers, and the reproduced bypasses: [THREAT_MODEL.md](https://github.com/Oaklight/codecell/blob/master/THREAT_MODEL.md).
 
 | Backend | Isolates | Does not isolate |
 |---------|----------|------------------|

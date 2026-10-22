@@ -147,11 +147,11 @@ class SubprocessRuntime(BaseRuntime):
     """Execute code in a subprocess for crash isolation.
 
     The code is validated via the provided :class:`Validator`, then run
-    in a fresh interpreter process.  Only crashes are isolated by that
-    process boundary.  Child memory, CPU, and disk use are not limited,
-    output is buffered in full before truncation, and ``timeout=None``
-    can block indefinitely.  This is crash isolation, not a sandbox; see
-    ``THREAT_MODEL.md``.
+    in a fresh interpreter process.  That boundary isolates crashes,
+    interpreter state, and caller memory; it does not isolate resource
+    use or adversaries.  Child memory, CPU, and disk use are not
+    limited, output is buffered in full before truncation, and
+    ``timeout=None`` can block indefinitely.  See ``THREAT_MODEL.md``.
 
     Usage::
 
@@ -256,7 +256,11 @@ class IpcSubprocessRuntime(BaseRuntime):
     LLM-generated code runs in the subprocess.
 
     Benefits over in-process ``exec()``:
-        - Crash isolation (segfault, OOM, infinite loop)
+        - Crash isolation: a segfault or an uncaught exception cannot take
+          down the caller
+        - A wall-clock bound on the child when ``timeout`` is passed; with
+          ``timeout=None`` an infinite loop blocks the dispatch loop
+          indefinitely, and an OOM can still reach the host OOM killer
         - No cloudpickle needed for tools
         - Tools retain access to main-process state (connections, env)
 

@@ -30,7 +30,7 @@ and multi-language backends.
 | Asset | Why it matters |
 |---|---|
 | Host filesystem | Readable and writable as the calling process's uid (measured: any file the caller can touch) |
-| Network | Unrestricted egress from the child (measured: outbound `connect()` succeeds) |
+| Network | No egress restriction (measured: `connect(('127.0.0.1', 9))` leaves the process and returns `ConnectionRefusedError`; that proves the syscall is not blocked, not that a remote host is reachable) |
 | Environment and secrets | Child inherits the full environment, including tokens and credentials (measured) |
 | Tool credentials | Tools execute in the **main** process, so a tool call borrows its full authority |
 | Agent availability | A hung or unkillable cell blocks the agent loop; orphaned children outlive the call (measured) |
@@ -75,8 +75,8 @@ guarantee.
 | Crash isolation | ENFORCED | Separate OS process (`subprocess.run` / `Popen`) |
 | Interpreter and global state per call | ENFORCED | Fresh interpreter per `execute()` |
 | Caller memory read | ENFORCED | Separate address space; nothing is shared or pickled into the child |
-| **Returned output size** | **PARTIAL** | `truncate()` caps the returned string at 65 536 bytes + marker, but `capture_output=True` buffers the **whole** stream in the parent first. Measured: 20 MB of stdout → parent peak RSS +57.4 MB, returned string 65 559 bytes |
-| Wall-clock bound on the **direct child** | ENFORCED | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child |
+| **Returned output size** | **PARTIAL** | `truncate()` caps the returned string at 65 536 bytes + marker, but the parent holds the **whole** stream first: `SubprocessRuntime` via `capture_output=True`, `IpcSubprocessRuntime` via a child-side `StringIO` shipped as one JSON line and buffered by the parent's reader and `json.loads`. Measured: 20 MB of stdout → parent peak RSS +57.4 MB, returned string 65 559 bytes |
+| Wall-clock bound on the **direct child** | ENFORCED, when `timeout` is set | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child. The API default is `timeout=None`, which is unbounded |
 | Wall-clock bound on the process **tree** | PARTIAL | Same `SIGKILL`, direct child only. No process group / no `setsid`; grandchildren survive (measured: `sleep 90` still alive after `timed_out=True`; #6) |
 | Filesystem, network, env, PID, resource limits | NONE | No namespace, seccomp, rlimit, cgroup, or uid change |
 | Code validation | ADVISORY | `ast` walk (`PythonValidator`) or regex (`BashValidator`) |
@@ -106,9 +106,9 @@ the top grade.
 | **Environment and secrets** | NONE — full env inherited | NONE — same env, reachable despite `os` being denied (measured: `HOME`, `USER`) | NONE — plus every tool call sees the main process's objects | TARGET — explicit, minimal env pass-through |
 | **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: no pid namespace) | NONE | TARGET — PID namespace, no host PIDs |
 | **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | TARGET — cgroup memory/CPU/pids limits |
-| **Timeout / kill semantics** | PARTIAL — `SIGKILL` to the direct child; tree leaks (measured: grandchild alive) | PARTIAL — same | PARTIAL — same, plus an undrained `stderr` stalls the child until the deadline (measured: 200 KB → hang until timeout; #5) | TARGET — container stop kills the whole cgroup |
+| **Timeout / kill semantics** | PARTIAL — `SIGKILL` to the direct child when `timeout` is set; tree leaks (measured: grandchild alive) | PARTIAL — same | PARTIAL — same, plus an undrained `stderr` stalls the child until the deadline (measured: 200 KB → hang until timeout; #5) | TARGET — container stop kills the whole cgroup |
 | **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — kwargs-only stub signature, JSON-only results turn a successful call into a failure (measured); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
-| **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — same | TARGET — bounded at collection inside the container |
+| **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — child-side `StringIO`, shipped as one JSON line, buffered by the parent's reader and `json.loads` | TARGET — bounded at collection inside the container |
 
 Notes:
 
@@ -146,17 +146,18 @@ constrains the *style* of code, not its authority. Any fix that keeps this an AS
 will be bypassable again; hardening of the validator is out of scope for 0.3.0 and the
 README must not describe its result as a security boundary.
 
-Because blocking is name-based, the validator also blocks legitimate code (`os.getcwd()`,
-`import sys`) while missing the escapes above. That asymmetry is the point: it is a UX and
+Because blocking is name-based, the validator also rejects legitimate code while missing
+the escapes above: `import sys` and `import os` are refused, `import io` is allowed — and
+`io.open` is the first bypass in the table. That asymmetry is the point: it is a UX and
 prompt-hygiene tool with a security-shaped API, which is why the docs must say so.
 
 ### 7.2 `BashValidator` (regex deny list)
 
-Measured against the shipped deny list: `sudo id`, `rm -rf /`, and other literal forms are
-blocked, but four of five obfuscated forms pass validation — `su''do id`, `s\udo id`,
-`r''m -rf /tmp/whatever`, and `echo $(r''m -rf /tmp/whatever)`. The regex inspects raw
-text; the shell performs quote removal after. The deny list is best-effort risk reduction
-and remains so in `bashtool`; it is not a sandbox and never was.
+Measured against the shipped deny list, of five forms tested four pass validation: `sudo
+id` is blocked; `su''do id`, `s\udo id`, `r''m -rf /tmp/whatever`, and
+`echo $(r''m -rf /tmp/whatever)` all pass. The regex inspects raw text; the shell performs
+quote removal after. The deny list is best-effort risk reduction and remains so in
+`bashtool`; it is not a sandbox and never was.
 
 ## 8. Timeout and kill semantics
 
@@ -172,7 +173,8 @@ was blocked on a full pipe the whole time.
 
 Consequence for agents: a timeout tells you the wrapper gave up, **not** that the work
 stopped. Do not treat `timed_out=True` as "the host is clean". Both behaviours are fixed
-by the IPC lifecycle issues (#5–#7), not by the validator.
+by the lifecycle issues — #5 for the `stderr` drain, #6 for the process-tree kill, which
+covers `SubprocessRuntime` as well as `IpcSubprocessRuntime` — not by the validator.
 
 ## 9. Resource limits
 
@@ -265,7 +267,9 @@ Process tree on timeout (`NullValidator`, so the cell may spawn): a cell that ru
 `timed_out=True, return_code=-1` after 3.0 s while `os.kill(pid, 0)` on the recorded
 grandchild still succeeds.
 
-`IpcSubprocessRuntime` stderr backpressure: `sys.stderr.write('x' * 200000)` returns
+`IpcSubprocessRuntime` stderr backpressure (under `NullValidator`, because
+`PythonValidator` rejects `import sys` before execution): `sys.stderr.write('x' * 200000)`
+returns
 `timed_out=True` after 8.01 s with empty `stdout` and empty `stderr` — the child never
 reached its `print`. A kwargs call (`add(a=1, b=2)`) returns `3`; the positional form
 (`add(1, 2)`) raises `TypeError`; a tool returning a `set` fails with `return_code=1`
