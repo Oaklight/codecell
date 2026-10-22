@@ -66,7 +66,7 @@ Guarantees are per backend and only count when the OS enforces them. Full table,
 
 | Backend | Isolates | Does not isolate |
 |---------|----------|------------------|
-| `SubprocessRuntime` | Crashes, interpreter state (fresh process), caller memory (separate address space) | Filesystem, network, environment, uid, resource use, process tree on timeout, output volume (the returned string is truncated at 64 KB, but the whole stream is buffered in the parent first) |
+| `SubprocessRuntime` | Crashes, interpreter state (fresh process), caller memory (separate address space), process tree on timeout/cancel (POSIX; direct child only on Windows) | Filesystem, network, environment, uid, resource use, output volume (the returned string is truncated at 64 KB, but the whole stream is buffered in the parent first) |
 | `IpcSubprocessRuntime` | Same | Same, and every tool call runs with the main process's full authority |
 | `ContainerRuntime` — **target, 0.4.0, not shipped** | Nothing yet; the design targets filesystem, network, PIDs, and resource limits | — |
 
@@ -100,7 +100,7 @@ Execute code in a subprocess. The validator provides language identity and code 
 |-----------|------|-------------|
 | `code` | `str` | Source code to execute |
 | `namespace` | `dict[str, Callable] \| None` | Callables to inject (Python only) |
-| `timeout` | `float \| None` | Max seconds before kill |
+| `timeout` | `float \| None` | Max seconds before kill; `0` expires immediately, `None` is unbounded |
 
 ### `CodeResult`
 

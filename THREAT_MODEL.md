@@ -62,13 +62,16 @@ Consequences that follow from the rule and are easy to get wrong:
 - Blocking *names* (`open`, `exec`, `__import__`) does not block *reachability*:
   `getattr(__builtins__, 'open')` and `(lambda: 0).__globals__['__builtins__'].open`
   are the same function.
-- Killing the direct child is not killing the work: a child's children survive.
+- On 0.2.1 and on Windows, killing the direct child is not killing the work: a child's
+  children survive. 0.3.0 kills the POSIX process group on timeout, cancellation, and
+  exceptions (#6).
 - A pipe that is never drained is a hang, not a stream.
 
-## 5. What the runtime actually enforces (0.2.1)
+## 5. What the runtime actually enforces (0.2.1, plus #6 on 0.3.0-dev)
 
-Every grade below was measured on 0.2.1. Anything not graded ENFORCED is not a
-guarantee.
+Every grade below was measured on 0.2.1, except the process-tree row, whose
+`start_new_session` + `killpg` behaviour was measured on the #6 branch. Anything
+not graded ENFORCED is not a guarantee.
 
 | Property | Grade | Mechanism and measurement |
 |---|---|---|
@@ -77,7 +80,7 @@ guarantee.
 | Caller memory read | ENFORCED | Separate address space; nothing is shared or pickled into the child |
 | **Returned output size** | **PARTIAL** | `truncate()` caps the returned string at 65 536 bytes + marker, but the parent holds the **whole** stream first: `SubprocessRuntime` via `capture_output=True`, `IpcSubprocessRuntime` via a child-side `StringIO` shipped as one JSON line and buffered by the parent's reader and `json.loads`. Measured: 20 MB of stdout → parent peak RSS +57.4 MB, returned string 65 559 bytes |
 | Wall-clock bound on the **direct child** | ENFORCED, when `timeout` is set | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child. The API default is `timeout=None`, which is unbounded |
-| Wall-clock bound on the process **tree** | PARTIAL | Same `SIGKILL`, direct child only. No process group / no `setsid`; grandchildren survive (measured: `sleep 90` still alive after `timed_out=True`; #6) |
+| Wall-clock bound on the process **tree** | ENFORCED on POSIX when `timeout` is set; PARTIAL on Windows | `start_new_session=True`, then `killpg(SIGTERM)` → 1 s grace → `killpg(SIGKILL)` on timeout, cancellation, and exceptions (#6). Windows signals only the direct child, so grandchildren may survive |
 | Filesystem, network, env, PID, resource limits | NONE | No namespace, seccomp, rlimit, cgroup, or uid change |
 | Code validation | ADVISORY | `ast` walk (`PythonValidator`) or regex (`BashValidator`) |
 
@@ -106,7 +109,7 @@ the top grade.
 | **Environment and secrets** | NONE — full env inherited | NONE — same env, reachable despite `os` being denied (measured: `HOME`, `USER`) | NONE — plus every tool call sees the main process's objects | TARGET — explicit, minimal env pass-through |
 | **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: no pid namespace) | NONE | TARGET — PID namespace, no host PIDs |
 | **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | TARGET — cgroup memory/CPU/pids limits |
-| **Timeout / kill semantics** | PARTIAL — `SIGKILL` to the direct child when `timeout` is set; tree leaks (measured: grandchild alive) | PARTIAL — same | PARTIAL — same, plus an undrained `stderr` stalls the child until the deadline (measured: 200 KB → hang until timeout; #5) | TARGET — container stop kills the whole cgroup |
+| **Timeout / kill semantics** | PARTIAL — group SIGTERM→SIGKILL on POSIX (#6); direct child only on Windows; captured output is returned | PARTIAL — same | PARTIAL — same, plus an undrained `stderr` stalls the child until the deadline (measured: 200 KB → hang until timeout; #5) | TARGET — container stop kills the whole cgroup |
 | **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — kwargs-only stub signature, JSON-only results turn a successful call into a failure (measured); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
 | **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — child-side `StringIO`, shipped as one JSON line, buffered by the parent's reader and `json.loads` | TARGET — bounded at collection inside the container |
 
@@ -161,9 +164,10 @@ quote removal after. The deny list is best-effort risk reduction and remains so 
 
 ## 8. Timeout and kill semantics
 
-`SubprocessRuntime` kills only the direct child on timeout, and `IpcSubprocessRuntime`
-additionally leaves the child blocked when `stderr` fills because the pipe is never
-drained. Both are reproduced:
+On 0.2.1, `SubprocessRuntime` killed only the direct child on timeout, and
+`IpcSubprocessRuntime` additionally left the child blocked when `stderr` filled because
+the pipe was never drained. The first is fixed on POSIX in 0.3.0 (#6); the second is #5.
+The 0.2.1 reproductions:
 
 - A cell that spawns `sleep 90` and then idles returns `timed_out=True` after 3.0 s with
 the grandchild (pid recorded by the cell itself) still running.
@@ -172,9 +176,9 @@ the grandchild (pid recorded by the cell itself) still running.
 was blocked on a full pipe the whole time.
 
 Consequence for agents: a timeout tells you the wrapper gave up, **not** that the work
-stopped. Do not treat `timed_out=True` as "the host is clean". Both behaviours are fixed
-by the lifecycle issues — #5 for the `stderr` drain, #6 for the process-tree kill, which
-covers `SubprocessRuntime` as well as `IpcSubprocessRuntime` — not by the validator.
+stopped. Do not treat `timed_out=True` as "the host is clean". The process-tree behaviour
+is fixed on POSIX by #6 (direct child only on Windows); the `stderr` backpressure is #5.
+Neither is a validator concern.
 
 ## 9. Resource limits
 
@@ -206,7 +210,7 @@ isolated; run codecell with the privileges you would give that code"*.
 |---|---|---|
 | Container backend | 0.4.0 / `ContainerRuntime` | The only backend permitted to claim T1/T2 isolation; each TARGET cell becomes ENFORCED only after it is measured |
 | `stderr` drain | #5 | Removes the backpressure hang from the timeout/kill row |
-| process-group kill on timeout and cancellation | #6 | Moves the timeout/kill row from PARTIAL to tree-bounded |
+| process-group kill on timeout and cancellation | #6 | Shipped in 0.3.0: the timeout/kill row is tree-bounded on POSIX; Windows remains direct-child-only |
 | tool-call arguments, result codec, protocol version | #7 | Removes the kwargs-only and non-JSON failure modes from the tool-access cell |
 | bash backend removal | #8 | Deletes an ADVISORY-only surface, and the allow-list confusion that came with it |
 | regression suite | #11 | Every reproduction in §7–§8 becomes an executable test |
@@ -262,10 +266,11 @@ rt.execute("import io; print([l for l in io.open('/proc/self/limits') if l.start
 # 'Max address space         unlimited            unlimited            bytes'
 ```
 
-Process tree on timeout (`NullValidator`, so the cell may spawn): a cell that runs
-`subprocess.Popen(['sleep', '90'])`, writes the pid to a file, then sleeps, returns
-`timed_out=True, return_code=-1` after 3.0 s while `os.kill(pid, 0)` on the recorded
-grandchild still succeeds.
+Process tree on timeout, 0.2.1 baseline (`NullValidator`, so the cell may spawn): a cell
+that runs `Popen(['sleep', '90'])`, writes the pid to a file, then sleeps, returned
+`timed_out=True, return_code=-1` after 3.0 s while the recorded grandchild was still
+alive. 0.3.0 tears down the POSIX group, so the grandchild is gone; Windows remains
+direct-child-only.
 
 `IpcSubprocessRuntime` stderr backpressure (under `NullValidator`, because
 `PythonValidator` rejects `import sys` before execution): `sys.stderr.write('x' * 200000)`
