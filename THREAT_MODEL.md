@@ -110,7 +110,7 @@ the top grade.
 | **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: no pid namespace) | NONE | TARGET — PID namespace, no host PIDs |
 | **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | TARGET — cgroup memory/CPU/pids limits |
 | **Timeout / kill semantics** | PARTIAL — group SIGTERM→SIGKILL on POSIX (#6); direct child only on Windows; captured output is returned | PARTIAL — same | PARTIAL — same; `stderr` is drained continuously into a bounded buffer (#5), so it cannot backpressure the child | TARGET — container stop kills the whole cgroup |
-| **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — kwargs-only stub signature, JSON-only results turn a successful call into a failure (measured); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
+| **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — positional/keyword calls and a JSON+tag codec (#7); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
 | **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — child-side `StringIO`, shipped as one JSON line, buffered by the parent's reader and `json.loads` | TARGET — bounded at collection inside the container |
 
 Notes:
@@ -217,7 +217,7 @@ isolated; run codecell with the privileges you would give that code"*.
 | Container backend | 0.4.0 / `ContainerRuntime` | The only backend permitted to claim T1/T2 isolation; each TARGET cell becomes ENFORCED only after it is measured |
 | `stderr` drain | #5 | Shipped in 0.3.0: removes the backpressure hang from the timeout/kill row and returns captured `stderr` on normal, timeout, and crash paths |
 | process-group kill on timeout and cancellation | #6 | Shipped in 0.3.0: the timeout/kill row is tree-bounded on POSIX; Windows remains direct-child-only |
-| tool-call arguments, result codec, protocol version | #7 | Removes the kwargs-only and non-JSON failure modes from the tool-access cell |
+| tool-call arguments, result codec, protocol version | #7 | Shipped in 0.3.0: removes the kwargs-only and non-JSON failure modes from the tool-access cell |
 | bash backend removal | #8 | Deletes an ADVISORY-only surface, and the allow-list confusion that came with it |
 | regression suite | #11 | Every reproduction in §7–§8 becomes an executable test |
 

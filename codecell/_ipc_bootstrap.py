@@ -8,10 +8,16 @@ the main process for real tool execution, then runs the code via
 
 Protocol (JSON messages):
 
-    Main → Sub:  {"type": "init", "tools": {"add": "doc"}, "code": "..."}
-    Sub → Main:  {"type": "call", "tool": "add", "kwargs": {"a": 1}}
-    Main → Sub:  {"type": "result", "value": 3}
-    Sub → Main:  {"type": "done", "stdout": "3\\n", "stderr": "", "rc": 0}
+    Main → Sub:  {"type": "init", "protocol": 1, "tools": {"add": "doc"}, "code": "..."}
+    Sub → Main:  {"type": "call", "protocol": 1, "tool": "add", "args": [1], "kwargs": {}}
+    Main → Sub:  {"type": "result", "protocol": 1, "value": 3}
+    Sub → Main:  {"type": "done", "protocol": 1, "stdout": "3\\n", "stderr": "", "rc": 0}
+
+Every frame carries ``protocol``; an unknown version is rejected with a
+terminal ``done`` and an actionable message.  Tool calls are serialized
+by a lock so calls from user threads cannot interleave frames.  Values
+are encoded by :mod:`codecell._wire`; an unencodable argument or result
+raises ``CodecError`` rather than being reported as a tool failure.
 
     On error:
     Main → Sub:  {"type": "result", "error": "ZeroDivisionError: ..."}
@@ -39,12 +45,20 @@ still terminate the process without a frame; the caller sees EOF.
 from __future__ import annotations
 
 import io
-import json
 import os
 import sys
+import threading
 import traceback
 from collections.abc import Callable
 from typing import Any
+
+from ._wire import (
+    MAX_TOOL_VALUE_BYTES,
+    PROTOCOL_VERSION,
+    CodecError,
+    dumps,
+    loads,
+)
 
 _HIGH_FD_START = 256
 _HIGH_FD_SEARCH = 256
@@ -148,20 +162,35 @@ def main() -> None:
     """Bootstrap entry point."""
     proto_in, proto_out = _reserve_protocol_channel()
 
-    def send_to_main(msg: dict) -> None:
-        proto_out.write(json.dumps(msg) + "\n")
+    def send_to_main(msg: dict, *, max_bytes: int | None = None) -> None:
+        proto_out.write(dumps(msg, max_bytes=max_bytes) + "\n")
         proto_out.flush()
 
     def recv_from_main() -> dict:
         line = proto_in.readline()
         if not line:
             raise EOFError("Main process closed pipe")
-        return json.loads(line)
+        return loads(line)
 
     init_line = proto_in.readline()
     if not init_line:
         sys.exit(1)
-    init = json.loads(init_line)
+    init = loads(init_line)
+    version = init.get("protocol")
+    if version != PROTOCOL_VERSION:
+        send_to_main(
+            {
+                "type": "done",
+                "protocol": PROTOCOL_VERSION,
+                "stdout": "",
+                "stderr": (
+                    f"Unsupported protocol version {version!r}; "
+                    f"codecell requires {PROTOCOL_VERSION}\n"
+                ),
+                "rc": 1,
+            }
+        )
+        return
 
     # tools can be a list of names (legacy) or a dict of name→doc
     raw_tools = init["tools"]
@@ -174,15 +203,39 @@ def main() -> None:
     captured_stdout = _Capture()
     sys.stdout = captured_stdout
 
-    # Build stub namespace
+    # Build stub namespace.  One lock covers the send/recv pair so calls
+    # from user threads are serialized instead of interleaving frames.
+    call_lock = threading.Lock()
     namespace: dict = {}
     for name, doc in tool_docs.items():
 
         def make_stub_fn(tool_name: str, tool_doc: str | None) -> Callable[..., Any]:
-            def stub(**kwargs):
-                send_to_main({"type": "call", "tool": tool_name, "kwargs": kwargs})
-                resp = recv_from_main()
+            def stub(*args, **kwargs):
+                with call_lock:
+                    try:
+                        send_to_main(
+                            {
+                                "type": "call",
+                                "protocol": PROTOCOL_VERSION,
+                                "tool": tool_name,
+                                "args": list(args),
+                                "kwargs": kwargs,
+                            },
+                            max_bytes=MAX_TOOL_VALUE_BYTES,
+                        )
+                    except CodecError as exc:
+                        raise CodecError(
+                            f"arguments for tool {tool_name!r} are not encodable: {exc}"
+                        ) from exc
+                    resp = recv_from_main()
+                if resp.get("protocol") != PROTOCOL_VERSION:
+                    raise RuntimeError(
+                        f"Protocol mismatch: main sent {resp.get('protocol')!r}, "
+                        f"expected {PROTOCOL_VERSION}"
+                    )
                 if resp.get("error"):
+                    if resp.get("error_kind") == "codec":
+                        raise CodecError(resp["error"])
                     raise RuntimeError(f"Tool {tool_name} failed: {resp['error']}")
                 return resp["value"]
 
@@ -197,7 +250,7 @@ def main() -> None:
     # KeyboardInterrupt still produce a terminal frame.
     import builtins
 
-    exec_globals: dict = {"__builtins__": builtins.__dict__}
+    exec_globals: dict = {"__builtins__": builtins.__dict__, "__name__": "__main__"}
     exec_globals.update(namespace)
 
     rc = 0
@@ -221,6 +274,7 @@ def main() -> None:
         send_to_main(
             {
                 "type": "done",
+                "protocol": PROTOCOL_VERSION,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "rc": rc,

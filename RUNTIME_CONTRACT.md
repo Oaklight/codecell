@@ -2,9 +2,9 @@
 
 Status: describes the protocol **as implemented on `master` after #17**
 (`IpcSubprocessRuntime`, including the channel hardening merged in #20), and the invariants
-every future backend must satisfy. Protocol versioning, positional arguments and the result
-codec remain 0.3.0 work (#7); process-group cleanup and continuous `stderr` draining shipped
-in 0.3.0 (#5, #6). Frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what
+every future backend must satisfy. Protocol v1, positional arguments and the result codec
+shipped in 0.3.0 (#7); process-group cleanup and continuous `stderr` draining shipped in
+0.3.0 (#5, #6). Frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what
 changes and what this document will then have to say.
 
 ## 1. The division of responsibility
@@ -21,11 +21,11 @@ Those are different things and the distinction is the whole contract.
 | Terminal frame on every exception-based exit path | shipped (#17/#20): `BaseException` caught, `SystemExit` normalized mod 256 |
 | Blocking until a tool call is answered | shipped |
 | Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is drained continuously (§3) |
-| Protocol versioning | **target — #7**; no version field exists today |
+| Protocol versioning | shipped in 0.3.0 (#7): `protocol: 1` on every frame, mismatch rejected with an actionable error |
 | Cancellation semantics | shipped in 0.3.0 (#6): group SIGTERM→SIGKILL; direct child only on Windows |
 | `stderr` drain | shipped in 0.3.0 (#5): bounded continuous drain, returned on every path |
 | Process-group cleanup | shipped in 0.3.0 (#6) on POSIX; direct child only on Windows |
-| Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
+| Result codec | shipped in 0.3.0 (#7): JSON plus tagged common types and a size limit; unencodable values raise `CodecError` |
 
 Rows marked *shipped* in the 0.3.0-dev column are **not** in the released 0.2.1: on the
 `v0.2.1` tag, `SystemExit` returns without a terminal frame (`rc=0, stdout=''`), the protocol
@@ -61,14 +61,16 @@ call. Lifecycle semantics belong to codecell; tool semantics belong to the calle
 
 If a feature needs any of these, it belongs in the caller, not in a backend.
 
-## 3. Wire protocol (v0, with the #17 channel hardening on master)
+## 3. Wire protocol (v1, with the #17 channel hardening on master)
 
-Wire format v0 is unchanged since 0.2.1; everything marked *(since #17)* is 0.3.0-dev only.
-The released 0.2.1 tag has plain fds 0/1 as the protocol channel, no terminal frame on
-`SystemExit`, and discarded `stderr`.
+Wire format v1 is the 0.3.0 protocol (#7). Every frame carries `protocol: 1`; a missing or
+different version is rejected with an actionable error. The released 0.2.1 tag has no
+version field, plain fds 0/1 as the protocol channel, no terminal frame on `SystemExit`, and
+discarded `stderr`.
 
 **Transport.** Newline-delimited UTF-8 JSON over the child's `stdin` (main → child) and
-`stdout` (child → main). Exactly one JSON object per line, no pretty-printing.
+`stdout` (child → main). Exactly one JSON object per line, no pretty-printing. Frames are
+encoded by `codecell._wire`: tool `args`, `kwargs` and result `value` use the codec in §5.
 
 The protocol channel is **reserved at the fd level** since #17 (#20). The bootstrap
 duplicates fds 0/1, relocates the duplicates to the first free descriptor at or above a
@@ -104,9 +106,10 @@ That is **hardening, not isolation**. User code shares the interpreter with the 
 frame introspection still reaches it —
 `sys._getframe().f_back.f_locals['send_to_main']({...})` returns `stdout='FORGED'` today —
 and `/proc/self/fd` still lists the relocated descriptors (measured:
-`['0','1','2','256','257','3']`). The parent ignores malformed frames (§6) but cannot tell
-a forged well-formed `done` from a genuine one. Full enforcement needs the writer in a
-separate process: #21, 0.4.0.
+`['0','1','2','256','257','3']`). The parent ignores malformed frames and rejects frames
+whose `protocol` is not 1 (§6), but a forged well-formed v1 `done` is still
+indistinguishable from a genuine one. Full enforcement needs the writer in a separate
+process: #21, 0.4.0.
 
 Two consequences worth knowing: a cell that closes the relocated descriptors destroys its
 own channel and is reported as `return_code=1` with a bootstrap traceback and empty output
@@ -117,10 +120,10 @@ captured in the child and delivered inside `done`.
 
 | # | Direction | `type` | Fields | Meaning |
 |---|---|---|---|---|
-| 1 | main → child | `init` | `tools`: object mapping tool name → docstring or `null`; `code`: string | Start one execution. A legacy list of names is also accepted |
-| 2 | child → main | `call` | `tool`: string; `kwargs`: object | Execute this tool with these **keyword** arguments. The child blocks immediately after sending |
-| 3 | main → child | `result` | `value`: any JSON value **or** `error`: string | Exactly one answer per `call`; `value` and `error` are mutually exclusive |
-| 4 | child → main | `done` | `stdout`: string; `stderr`: string; `rc`: integer | The code finished (normally or by raising). Terminal message |
+| 1 | main → child | `init` | `protocol`: integer; `tools`: object mapping tool name → docstring or `null`; `code`: string | Start one execution. A legacy list of names is also accepted |
+| 2 | child → main | `call` | `protocol`: integer; `tool`: string; `args`: array; `kwargs`: object | Execute this tool with these positional and keyword arguments. The child blocks immediately after sending |
+| 3 | main → child | `result` | `protocol`: integer; `value`: any codec value **or** `error`: string; `error_kind`: `"codec"` when the failure is encoding | Exactly one answer per `call`; `value` and `error` are mutually exclusive |
+| 4 | child → main | `done` | `protocol`: integer; `stdout`: string; `stderr`: string; `rc`: integer | The code finished (normally or by raising). Terminal message |
 
 **Ordering and lifecycle rules.**
 
@@ -133,13 +136,17 @@ captured in the child and delivered inside `done`.
   covered: `os._exit(0)` looks exactly like an empty success (`rc=0, stdout=''`), and a
   fatal signal surfaces as a negative `return_code` (§6).
 - `call` and `result` strictly alternate. The child has no other source of input while
-  blocked, so a runtime that does not answer stalls the cell.
+  blocked, so a runtime that does not answer stalls the cell. `args` and `kwargs` are
+  codec-encoded by the child and decoded by the caller before `fn(*args, **kwargs)` runs.
 - `done` is produced only by the child finishing. A child killed on timeout sends
   nothing; the main process reports that as `timed_out=True, return_code=-1` with empty
   output.
-- 0.2.1 has **no message ids and no version field**: concurrent calls from user threads
-  interleave and corrupt the stream, and an old caller cannot detect a new child. Treat
-  one runtime instance as single-threaded until #7 lands.
+- Since #7 every frame carries `protocol: 1`, and a missing or different version is
+  rejected: the child emits a terminal `done` with an actionable message when `init` is
+  wrong, and the parent fails the call when a child frame is wrong. Calls from user threads
+  are serialized by a child-side lock, so one `call` is outstanding at a time. There are
+  still no message ids; a custom transport must not multiplex frames from multiple
+  executions onto one stream.
 - User `sys.stderr` is **not** redirected: writes go to the OS `stderr` pipe. Since #5 the
   parent drains that pipe continuously into a bounded buffer (the first 64 KiB) and merges it
   into `CodeResult.stderr` on every path — normal `done`, timeout, and crash/EOF. On a normal
@@ -152,30 +159,39 @@ captured in the child and delivered inside `done`.
 
 ## 4. Errors on the wire
 
-A `result` with `error` is the only in-band failure channel. The child turns it into a
-`RuntimeError("Tool <name> failed: <error>")`, so tool failures are Python exceptions at
-the call site rather than silent values.
+A `result` with `error` is the only in-band failure channel. The child turns it into
+`RuntimeError("Tool <name> failed: <error>")`, except when `error_kind` is `"codec"`: that
+becomes `CodecError` (a `TypeError`) carrying the codec message, so a successful call whose
+value cannot cross the wire is not reported as a tool failure.
 
 | Cause | `result.error` | Code sees |
 |---|---|---|
 | Tool raised | `"<ExceptionType>: <message>"` | `RuntimeError` |
 | A `call` names something not in the namespace | `"Unknown tool: <name>"` | Unreachable from user code: an unbound name is a plain `NameError` in the child before any IPC happens. The dispatcher keeps this as a defensive path |
-| Tool returned a non-JSON value (0.2.1 defect) | `"TypeError: Object of type <T> is not JSON serializable"` | `RuntimeError` — a **successful** call reported as failure (#7) |
+| Tool returned an unencodable value | `"cannot encode <T> on the wire; ..."` | `CodecError` — the call succeeded; its value has no wire representation |
+| Tool returned a value over the size limit | `"encoded payload is N bytes, limit is ..."` | `CodecError` |
+| Tool **arguments** cannot be encoded | no frame is sent | `CodecError` in the child before the call reaches the caller; surfaces as a child-side traceback (`return_code=1`) |
 
 ## 5. Result codec
 
-- Values must be JSON-serializable. `str`, `int`, `float`, `bool`, `None`, lists, and
-  dicts with string keys work.
-- Non-JSON values (`set`, `bytes`, `datetime`, custom objects) currently fail as shown
-  above. #7 defines the codec: deterministic encoding for common types or an explicit,
-  documented codec error — never a generic "tool failed" for a successful call.
-- Tool **arguments** are serialized in the child before any frame is sent, so they must be
-  JSON-serializable as well. A non-JSON argument fails *before* the call reaches the
-  caller: `f(x={1, 2})` raises `TypeError ... when serializing dict item 'kwargs'` as a
-  child-side traceback (`return_code=1`), bypassing the `result.error` channel. #7 owns
-  both directions.
-- The returned `stdout`/`stderr` strings are truncated to 64 KiB per stream in the main
-  process, after capture.
+`codecell._wire` encodes both directions, so a value sent by the child and returned by the
+caller round-trips to the same type.
+
+- JSON-native values pass through: `str`, `int`, `float`, `bool`, `None`, lists, and
+  dicts. Tuples are encoded as arrays and arrive as lists; dicts with non-string keys are
+  converted by JSON.
+- Tagged values use a reserved `{"$codecell": <tag>, "value": ...}` object:
+  `datetime`/`date`/`time` → ISO 8601; `timedelta` → seconds; `Decimal`, `UUID`, `Path` →
+  string; `set`/`frozenset` → a list sorted by `repr` (deterministic for the same set);
+  `bytes`/`bytearray` → base64. A user dict with exactly that shape is decoded as the tag.
+- Anything else raises `CodecError`, a `TypeError` subclass exported as
+  `codecell.CodecError`, with the type name and the supported alternatives. It is never
+  reported as "tool failed".
+- Both tool arguments and tool results are limited to `MAX_TOOL_VALUE_BYTES` (1 MiB) of
+  encoded JSON. The limit is configurable at the codec boundary
+  (`_wire.dumps(value, max_bytes=...)`); exceeding it raises `CodecError`.
+- The returned `stdout`/`stderr` strings are separately truncated to 64 KiB per stream in
+  the main process, after capture.
 
 ## 6. Failure modes as the caller sees them
 
@@ -188,9 +204,11 @@ the call site rather than silent values.
 | `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost. `os._exit(0)` is byte-identical to an empty cell (`rc=0, stdout=''`), so "finished" cannot be distinguished from "transport died" without a terminal frame |
 | Fatal signal | `return_code` is the **negative** signal number (`-15` `SIGTERM`, `-9` `SIGKILL`), not a 0–255 exit status; `stdout` lost. `SIGHUP` yields `-1`, which collides with the timeout sentinel — disambiguate with `timed_out` |
 | Channel destroyed (the cell closed the relocated fds) | `return_code=1`, bootstrap traceback in `stderr`, `stdout` lost |
-| Malformed frame, newline-terminated | ignored: junk on a protocol fd no longer fails the call (measured: `rc=0`, real output intact) |
+| Protocol mismatch | `return_code=1`; the child's actionable `done.stderr` when `init` is wrong, or `"Protocol mismatch: child sent ..., expected 1"` when a child frame is wrong |
+| Malformed frame, newline-terminated | ignored when it is not a JSON object; a JSON object with a wrong or missing `protocol` fails the call as a protocol mismatch |
 | Malformed frame without a trailing newline | coalesces with the genuine `done` line, which is then dropped; the call ends at EOF with `stdout=''` (measured) |
 | Tool failed | `return_code=1`, `RuntimeError` traceback in `stderr` |
+| Tool result unencodable | `CodecError` at the call site; uncaught, `return_code=1` with its traceback |
 
 A caller must treat `timed_out=True` as "the wrapper gave up", not "the work stopped":
 0.3.0 kills the process group on POSIX (#6); on Windows only the direct child is killed,
@@ -202,7 +220,10 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 
 - [ ] Implements the four message roles with the same field names and directions.
 - [ ] Performs a version handshake and rejects an unknown protocol version with an
-      actionable error (required from protocol v1).
+      actionable error (protocol v1 does this).
+- [ ] Round-trips the documented codec types, or rejects an unencodable argument or result
+      with a distinct codec error — never as a tool failure.
+- [ ] Serializes concurrent tool calls, or rejects them with a clear error.
 - [ ] Makes the protocol channel **unreachable**, not merely hidden. Hiding the fds is not
       enough while executed code shares the interpreter with the writer: #17/#20 closed the
       obvious handles and #23 stopped `exec` inheritance, but frame introspection and
@@ -242,12 +263,12 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 | Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee. The `/proc/<pid>/fd` reopen vector is explicitly listed as an open residual |
 | Process-group kill on timeout/cancellation | #6 | Cancellation semantics are a defined lifecycle operation (§6, §7): group SIGTERM→SIGKILL on POSIX; direct child only on Windows |
 | Continuous `stderr` drain | #5 | §3's `stderr` caveat becomes a guarantee: bounded buffer, returned on normal, timeout, and crash paths |
+| Protocol v1, positional args, codec, `__name__`, call lock | #7 | §3 is v1 with a version field on every frame; §4/§5 define `CodecError` and the tagged codec; concurrency is serialized by the child |
 
 ### Remaining 0.3.0 work
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |
 

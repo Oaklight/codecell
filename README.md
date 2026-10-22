@@ -88,6 +88,30 @@ result = py.execute(
 # stdout: "True"
 ```
 
+### Tool calls over IPC
+
+`IpcSubprocessRuntime` routes stub calls back to the main process, so tools actually run.
+Positional and keyword arguments both work:
+
+```python
+from codecell import IpcSubprocessRuntime, NullValidator
+
+runtime = IpcSubprocessRuntime(NullValidator("python"))
+result = runtime.execute(
+    "print(add(3, 4), add(3, b=4))",
+    namespace={"add": lambda a, b: a + b},
+)
+# stdout: "7 7\n"
+```
+
+Arguments and results share a JSON codec (`codecell._wire`). JSON-native values pass
+through, and `datetime`, `date`, `time`, `timedelta`, `Decimal`, `UUID`, `Path`, `set`,
+`frozenset`, `bytes`, and `bytearray` round-trip through tagged objects. Anything else
+raises `CodecError` (a `TypeError` subclass) instead of being reported as a tool failure.
+Arguments and results are capped at 1 MiB encoded; `stdout`/`stderr` remain capped at
+64 KiB each. Every frame carries `protocol: 1`, and a mismatch fails the call with an
+actionable error.
+
 ## API
 
 ### `SubprocessRuntime(validator)`
