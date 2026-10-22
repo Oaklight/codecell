@@ -3,7 +3,8 @@
 Status: describes the protocol **as implemented on `master` after #17**
 (`IpcSubprocessRuntime`, including the channel hardening merged in #20), and the invariants
 every future backend must satisfy. Protocol versioning, positional arguments, the result
-codec, `stderr` handling, and process-group cleanup are still 0.3.0 work (#5, #6, #7);
+codec and `stderr` handling remain 0.3.0 work (#5, #7); process-group cleanup shipped
+in 0.3.0 (#6).
 frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what changes and what
 this document will then have to say.
 
@@ -22,9 +23,9 @@ Those are different things and the distinction is the whole contract.
 | Blocking until a tool call is answered | shipped |
 | Capturing the code's `stdout`, returning `stdout`/`stderr`/`rc` | shipped; user `stderr` is discarded (§3) |
 | Protocol versioning | **target — #7**; no version field exists today |
-| Cancellation semantics | **target — #6**; today a timeout kills the direct child only |
+| Cancellation semantics | shipped in 0.3.0 (#6): group SIGTERM→SIGKILL; direct child only on Windows |
 | `stderr` drain | **target — #5**; today discarded, or it stalls the cell |
-| Process-group cleanup | **target — #6**; today grandchildren survive |
+| Process-group cleanup | shipped in 0.3.0 (#6) on POSIX; direct child only on Windows |
 | Result codec | **target — #7**; today JSON-only, and a non-JSON result is reported as a tool failure |
 
 Rows marked *shipped* in the 0.3.0-dev column are **not** in the released 0.2.1: on the
@@ -179,7 +180,7 @@ the call site rather than silent values.
 |---|---|
 | Code ran and returned | `return_code=0`, `timed_out=False` |
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
-| Timeout | `timed_out=True`, `return_code=-1`, empty output |
+| Timeout | `timed_out=True`, `return_code=-1`, captured output so far (stderr capture is #5) |
 | Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
 | `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost. `os._exit(0)` is byte-identical to an empty cell (`rc=0, stdout=''`), so "finished" cannot be distinguished from "transport died" without a terminal frame |
 | Fatal signal | `return_code` is the **negative** signal number (`-15` `SIGTERM`, `-9` `SIGKILL`), not a 0–255 exit status; `stdout` lost. `SIGHUP` yields `-1`, which collides with the timeout sentinel — disambiguate with `timed_out` |
@@ -189,7 +190,8 @@ the call site rather than silent values.
 | Tool failed | `return_code=1`, `RuntimeError` traceback in `stderr` |
 
 A caller must treat `timed_out=True` as "the wrapper gave up", not "the work stopped":
-0.2.1 kills only the direct child, so grandchildren survive (#6).
+0.3.0 kills the process group on POSIX (#6); on Windows only the direct child is killed,
+so grandchildren may survive.
 
 ## 7. Backend compliance checklist
 
@@ -234,13 +236,13 @@ A new backend (`ContainerRuntime`, Wasm, remote sandbox) is contract-compliant w
 | Change | Issue | Effect on this document |
 |---|---|---|
 | Protocol channel hardening and terminal frame | #17 / #20 / #23 | §3 moves from gap to **hardened** for fd handles and `BaseException`; full enforcement is #21, stated as a non-guarantee. The `/proc/<pid>/fd` reopen vector is explicitly listed as an open residual |
+| Process-group kill on timeout/cancellation | #6 | Cancellation semantics are a defined lifecycle operation (§6, §7): group SIGTERM→SIGKILL on POSIX; direct child only on Windows |
 
 ### Remaining 0.3.0 work
 
 | Change | Issue | Effect on this document |
 |---|---|---|
 | `stderr` drained continuously | #5 | Removes the "stderr is unread until exit" caveat in §3 |
-| Process-group kill on timeout/cancellation | #6 | Cancellation semantics become a defined lifecycle operation (§6, §7) |
 | Positional args, result codec, `__name__`, `protocol` field | #7 | Replaces "v0" in §3 with protocol v1 and the version handshake |
 | Transport/Protocol split | #10 | The four roles move behind an explicit `Protocol` object; the wire stays as specified here |
 | Container backend | 0.4.0 | First backend that must pass the §7 checklist under a hostile-code threat model |

@@ -7,8 +7,12 @@ and provide their own validation logic and interpreter invocation.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -37,6 +41,86 @@ def truncate(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return truncated + "\n... [output truncated]"
+
+
+_IS_POSIX = os.name == "posix"
+_GRACE_SECONDS = 1.0
+_ATEXIT_SECONDS = 2.0
+_REAP_SECONDS = 5.0
+
+
+def _spawn_kwargs() -> dict[str, Any]:
+    """Return Popen kwargs that put the child in its own process group."""
+    return {"start_new_session": True} if _IS_POSIX else {}
+
+
+def _pin_pidfd(pid: int) -> int | None:
+    """Pin *pid* against reuse while the group is being torn down."""
+    opener = getattr(os, "pidfd_open", None)
+    if not _IS_POSIX or opener is None:
+        return None
+    try:
+        return opener(pid)
+    except OSError:
+        return None
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _group_alive(proc: subprocess.Popen[Any]) -> bool:
+    """Return whether any process in the child's group still exists."""
+    if not _IS_POSIX:
+        return proc.poll() is None
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_group(proc: subprocess.Popen[Any], sig: int) -> None:
+    """Signal the child's process group on POSIX, or the child elsewhere."""
+    if _IS_POSIX:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, sig)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(sig)
+
+
+def _terminate_group(proc: subprocess.Popen[Any], grace: float = _GRACE_SECONDS) -> None:
+    """SIGTERM the child's group, wait, then SIGKILL survivors and reap.
+
+    On Windows only the direct child is signalled; grandchildren may
+    survive.  The leader's pid is pinned by the caller with
+    :func:`_pin_pidfd` so the group id cannot be recycled during teardown.
+    """
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if proc.poll() is None:
+        _signal_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _group_alive(proc):
+            break
+        time.sleep(0.02)
+    if proc.poll() is None or _group_alive(proc):
+        _signal_group(proc, kill_signal)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_REAP_SECONDS)
+
+
+def _as_text(value: str | bytes | None) -> str:
+    """Decode a communicate() payload, which is bytes on timeout."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 class Validator(ABC):
@@ -176,7 +260,8 @@ class SubprocessRuntime(BaseRuntime):
             namespace: Mapping of name -> callable.  Currently supported
                 for Python (injected as stubs); raises ``NotImplementedError``
                 for other languages.
-            timeout: Maximum wall-clock seconds before kill.
+            timeout: Maximum wall-clock seconds before kill.  ``None`` is
+                unbounded; ``0`` expires immediately.
 
         Returns:
             A :class:`CodeResult` with captured output.
@@ -190,29 +275,45 @@ class SubprocessRuntime(BaseRuntime):
         self._validator.validate(code)
 
         script = self._build_script(code, namespace)
-
+        proc = subprocess.Popen(
+            [*self._validator.interpreter, script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_spawn_kwargs(),
+        )
+        pidfd = _pin_pidfd(proc.pid)
+        timed_out = False
         try:
-            result = subprocess.run(
-                [*self._validator.interpreter, script],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                partial_stdout = _as_text(exc.stdout)
+                partial_stderr = _as_text(exc.stderr)
+                _terminate_group(proc)
+                try:
+                    tail_stdout, tail_stderr = proc.communicate(timeout=_REAP_SECONDS)
+                except subprocess.TimeoutExpired as drain_exc:
+                    tail_stdout = drain_exc.stdout
+                    tail_stderr = drain_exc.stderr
+                return CodeResult(
+                    stdout=truncate(partial_stdout + _as_text(tail_stdout)),
+                    stderr=truncate(partial_stderr + _as_text(tail_stderr)),
+                    return_code=-1,
+                    timed_out=True,
+                )
             return CodeResult(
-                stdout=truncate(result.stdout),
-                stderr=truncate(result.stderr),
-                return_code=result.returncode,
+                stdout=truncate(_as_text(stdout)),
+                stderr=truncate(_as_text(stderr)),
+                return_code=proc.returncode,
                 timed_out=False,
             )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout
-            stderr = exc.stderr
-            return CodeResult(
-                stdout=truncate(stdout if isinstance(stdout, str) else ""),
-                stderr=truncate(stderr if isinstance(stderr, str) else ""),
-                return_code=-1,
-                timed_out=True,
-            )
+        finally:
+            if not timed_out:
+                # Kill descendants that outlived the leader.
+                _terminate_group(proc)
+            _close_fd(pidfd)
 
     def _build_script(
         self,
@@ -304,7 +405,8 @@ class IpcSubprocessRuntime(BaseRuntime):
             code: Source code to execute.
             namespace: Mapping of name -> callable.  These are callable
                 from the subprocess code via IPC back to the main process.
-            timeout: Maximum wall-clock seconds before kill.
+            timeout: Maximum wall-clock seconds before kill.  ``None`` is
+                unbounded; ``0`` expires immediately.
 
         Returns:
             A :class:`CodeResult` with captured output.
@@ -335,19 +437,19 @@ class IpcSubprocessRuntime(BaseRuntime):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **_spawn_kwargs(),
         )
+        pidfd = _pin_pidfd(proc.pid)
 
         try:
             return self._dispatch_loop(proc, code, tool_docs, namespace or {}, timeout)
-        except Exception:
-            proc.kill()
-            raise
         finally:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # Give the leader a bounded chance to finish its own shutdown
+            # (atexit handlers), then tear down anything left in the group.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_ATEXIT_SECONDS)
+            _terminate_group(proc)
+            _close_fd(pidfd)
 
     def _dispatch_loop(
         self,
@@ -390,14 +492,14 @@ class IpcSubprocessRuntime(BaseRuntime):
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()
 
-        deadline = time.monotonic() + timeout if timeout else None
+        deadline = time.monotonic() + timeout if timeout is not None else None
 
         while True:
             # Calculate remaining time for queue.get
             if deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    proc.kill()
+                    _terminate_group(proc)
                     return CodeResult(
                         stdout="",
                         stderr="",
@@ -411,7 +513,7 @@ class IpcSubprocessRuntime(BaseRuntime):
                 line = line_queue.get(timeout=remaining)
             except queue.Empty:
                 # Timeout
-                proc.kill()
+                _terminate_group(proc)
                 return CodeResult(
                     stdout="",
                     stderr="",
@@ -420,12 +522,14 @@ class IpcSubprocessRuntime(BaseRuntime):
                 )
 
             if line is None:
-                # Subprocess died unexpectedly
+                # Subprocess died unexpectedly. Tear down any group members
+                # first so a descendant holding stderr cannot block the read.
+                _terminate_group(proc)
                 stderr = proc.stderr.read()
                 return CodeResult(
                     stdout="",
                     stderr=truncate(stderr),
-                    return_code=proc.wait(),
+                    return_code=proc.returncode if proc.returncode is not None else -1,
                     timed_out=False,
                 )
 
