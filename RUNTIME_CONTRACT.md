@@ -4,9 +4,8 @@ Status: describes the protocol **as implemented on `master` after #17**
 (`IpcSubprocessRuntime`, including the channel hardening merged in #20), and the invariants
 every future backend must satisfy. Protocol versioning, positional arguments, the result
 codec and `stderr` handling remain 0.3.0 work (#5, #7); process-group cleanup shipped
-in 0.3.0 (#6).
-frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what changes and what
-this document will then have to say.
+in 0.3.0 (#6). Frame integrity across a shared interpreter is #21 (0.4.0). §8 lists what
+changes and what this document will then have to say.
 
 ## 1. The division of responsibility
 
@@ -180,7 +179,7 @@ the call site rather than silent values.
 |---|---|
 | Code ran and returned | `return_code=0`, `timed_out=False` |
 | Code raised | `return_code=1`, traceback in `stderr` (inside `done`) |
-| Timeout | `timed_out=True`, `return_code=-1`, captured output so far (stderr capture is #5) |
+| Timeout | `timed_out=True`, `return_code=-1`. `SubprocessRuntime` returns the `stdout`/`stderr` read before the deadline (the IPC `stderr` drain is #5); `IpcSubprocessRuntime` returns empty `stdout`, because captured output only travels in `done` |
 | Code raised `SystemExit(n)` | `return_code = n % 256` (`0` for `None`); captured output kept; no traceback. `SystemExit('msg')` → `return_code=1` with `msg` on `stderr` |
 | `os._exit(n)` | `return_code = n`, `stdout=''` — captured output is always lost. `os._exit(0)` is byte-identical to an empty cell (`rc=0, stdout=''`), so "finished" cannot be distinguished from "transport died" without a terminal frame |
 | Fatal signal | `return_code` is the **negative** signal number (`-15` `SIGTERM`, `-9` `SIGKILL`), not a 0–255 exit status; `stdout` lost. `SIGHUP` yields `-1`, which collides with the timeout sentinel — disambiguate with `timed_out` |

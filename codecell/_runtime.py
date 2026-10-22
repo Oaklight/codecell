@@ -88,10 +88,10 @@ def _group_alive(proc: subprocess.Popen[Any]) -> bool:
 def _signal_group(proc: subprocess.Popen[Any], sig: int) -> None:
     """Signal the child's process group on POSIX, or the child elsewhere."""
     if _IS_POSIX:
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(OSError):
             os.killpg(proc.pid, sig)
     else:
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(OSError):
             proc.send_signal(sig)
 
 
@@ -101,19 +101,34 @@ def _terminate_group(proc: subprocess.Popen[Any], grace: float = _GRACE_SECONDS)
     On Windows only the direct child is signalled; grandchildren may
     survive.  The leader's pid is pinned by the caller with
     :func:`_pin_pidfd` so the group id cannot be recycled during teardown.
+
+    Liveness is decided on the *group*, not the leader: both runtimes reap
+    the leader before teardown on normal and crash exits, while detached
+    descendants keep the group alive.  Teardown also completes even when a
+    second ``KeyboardInterrupt`` arrives during the grace period — SIGKILL
+    still goes out, and the interrupt is re-raised afterwards so it is not
+    swallowed.
     """
     kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-    if proc.poll() is None:
-        _signal_group(proc, signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        if proc.poll() is not None and not _group_alive(proc):
-            break
-        time.sleep(0.02)
-    if proc.poll() is None or _group_alive(proc):
-        _signal_group(proc, kill_signal)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=_REAP_SECONDS)
+    interrupted: BaseException | None = None
+    try:
+        if proc.poll() is None or _group_alive(proc):
+            _signal_group(proc, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if proc.poll() is not None and not _group_alive(proc):
+                break
+            time.sleep(0.02)
+    except BaseException as exc:  # noqa: BLE001 - finish teardown, then re-raise
+        interrupted = exc
+    finally:
+        with contextlib.suppress(BaseException):
+            if proc.poll() is None or _group_alive(proc):
+                _signal_group(proc, kill_signal)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_REAP_SECONDS)
+    if interrupted is not None:
+        raise interrupted
 
 
 def _as_text(value: str | bytes | None) -> str:
@@ -287,19 +302,19 @@ class SubprocessRuntime(BaseRuntime):
         try:
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
+            except subprocess.TimeoutExpired:
                 timed_out = True
-                partial_stdout = _as_text(exc.stdout)
-                partial_stderr = _as_text(exc.stderr)
                 _terminate_group(proc)
+                # communicate() keeps its buffer across calls: the retry
+                # returns everything already read, so it supersedes (not
+                # extends) the TimeoutExpired payload.
                 try:
-                    tail_stdout, tail_stderr = proc.communicate(timeout=_REAP_SECONDS)
+                    stdout, stderr = proc.communicate(timeout=_REAP_SECONDS)
                 except subprocess.TimeoutExpired as drain_exc:
-                    tail_stdout = drain_exc.stdout
-                    tail_stderr = drain_exc.stderr
+                    stdout, stderr = drain_exc.stdout, drain_exc.stderr
                 return CodeResult(
-                    stdout=truncate(partial_stdout + _as_text(tail_stdout)),
-                    stderr=truncate(partial_stderr + _as_text(tail_stderr)),
+                    stdout=truncate(_as_text(stdout)),
+                    stderr=truncate(_as_text(stderr)),
                     return_code=-1,
                     timed_out=True,
                 )
@@ -310,10 +325,12 @@ class SubprocessRuntime(BaseRuntime):
                 timed_out=False,
             )
         finally:
-            if not timed_out:
-                # Kill descendants that outlived the leader.
-                _terminate_group(proc)
-            _close_fd(pidfd)
+            try:
+                if not timed_out:
+                    # Kill descendants that outlived the leader.
+                    _terminate_group(proc)
+            finally:
+                _close_fd(pidfd)
 
     def _build_script(
         self,
@@ -446,10 +463,17 @@ class IpcSubprocessRuntime(BaseRuntime):
         finally:
             # Give the leader a bounded chance to finish its own shutdown
             # (atexit handlers), then tear down anything left in the group.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=_ATEXIT_SECONDS)
-            _terminate_group(proc)
-            _close_fd(pidfd)
+            # The nested finally keeps teardown running even when the
+            # exception that brought us here (e.g. KeyboardInterrupt) is
+            # still in flight.
+            try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=_ATEXIT_SECONDS)
+            finally:
+                try:
+                    _terminate_group(proc)
+                finally:
+                    _close_fd(pidfd)
 
     def _dispatch_loop(
         self,

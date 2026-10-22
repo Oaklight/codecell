@@ -67,10 +67,11 @@ Consequences that follow from the rule and are easy to get wrong:
   exceptions (#6).
 - A pipe that is never drained is a hang, not a stream.
 
-## 5. What the runtime actually enforces (0.2.1)
+## 5. What the runtime actually enforces (0.2.1, plus #6 on 0.3.0-dev)
 
-Every grade below was measured on 0.2.1. Anything not graded ENFORCED is not a
-guarantee.
+Every grade below was measured on 0.2.1, except the process-tree row, whose
+`start_new_session` + `killpg` behaviour was measured on the #6 branch. Anything
+not graded ENFORCED is not a guarantee.
 
 | Property | Grade | Mechanism and measurement |
 |---|---|---|

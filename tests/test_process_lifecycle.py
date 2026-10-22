@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import sys
 import time
 
@@ -101,28 +102,45 @@ def test_normal_return_kills_leftover_grandchild(kind, tmp_path):
     runtime = _runtime(kind)
     code = _spawn_code(pidfile, linger=False)
     try:
+        start = time.monotonic()
         result = runtime.execute(code, timeout=10)
+        elapsed = time.monotonic() - start
         assert result.return_code == 0
         pid = _read_pid(pidfile)
         assert _wait_gone(pid), f"grandchild {pid} outlived a normal return"
+        # A welded-shut SIGTERM guard burns the full 1 s grace period.
+        assert elapsed < 0.75, f"teardown waited {elapsed:.2f}s for a group kill"
     finally:
         if os.path.exists(pidfile):
             with open(pidfile) as fh:
                 _cleanup(int(fh.read()))
 
 
-def test_crash_kills_leftover_grandchild(tmp_path):
+@pytest.mark.parametrize("kind", ["subprocess", "ipc"])
+def test_crash_kills_leftover_grandchild(kind, tmp_path):
     pidfile = str(tmp_path / "pid")
-    runtime = IpcSubprocessRuntime(NullValidator("python"))
+    runtime = _runtime(kind)
     try:
+        start = time.monotonic()
         result = runtime.execute(_spawn_code(pidfile, exit_code=3), timeout=10)
+        elapsed = time.monotonic() - start
         assert result.return_code == 3
         pid = _read_pid(pidfile)
         assert _wait_gone(pid), f"grandchild {pid} survived a crash"
+        assert elapsed < 0.75, f"teardown waited {elapsed:.2f}s for a group kill"
     finally:
         if os.path.exists(pidfile):
             with open(pidfile) as fh:
                 _cleanup(int(fh.read()))
+
+
+def test_timeout_output_is_not_duplicated():
+    code = (
+        "import sys, time\nsys.stdout.write('PARTIAL-LINE\\n')\nsys.stdout.flush()\ntime.sleep(60)"
+    )
+    result = SubprocessRuntime(NullValidator("python")).execute(code, timeout=1)
+    assert result.timed_out is True
+    assert result.stdout.count("PARTIAL-LINE") == 1, result.stdout
 
 
 @pytest.mark.parametrize("kind", ["subprocess", "ipc"])
@@ -132,6 +150,31 @@ def test_timeout_zero_is_immediate(kind):
     elapsed = time.monotonic() - start
     assert result.timed_out is True
     assert elapsed < 3, f"timeout=0 took {elapsed:.2f}s"
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("kind", ["subprocess", "ipc"])
+def test_keyboard_interrupt_tears_down_group(kind, tmp_path):
+    """Cancellation must not leave detached descendants behind."""
+    pidfile = str(tmp_path / "pid")
+    previous = signal.signal(signal.SIGALRM, _raise_keyboard_interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2.0)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _runtime(kind).execute(_spawn_code(pidfile), timeout=30)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    try:
+        pid = _read_pid(pidfile)
+        assert _wait_gone(pid), f"grandchild {pid} survived cancellation"
+    finally:
+        if os.path.exists(pidfile):
+            with open(pidfile) as fh:
+                _cleanup(int(fh.read()))
 
 
 def test_sigterm_ignoring_child_is_sigkilled():
