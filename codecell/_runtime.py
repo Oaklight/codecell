@@ -345,9 +345,9 @@ class SubprocessRuntime(BaseRuntime):
 
         Args:
             code: Source code to execute.
-            namespace: Mapping of name -> callable.  Currently supported
-                for Python (injected as stubs); raises ``NotImplementedError``
-                for other languages.
+            namespace: Mapping of name -> callable.  Not supported here:
+                ``SubprocessRuntime`` has no call channel.  Use
+                :class:`IpcSubprocessRuntime` for tool calls.
             timeout: Maximum wall-clock seconds before kill.  ``None`` is
                 unbounded; ``0`` expires immediately.
 
@@ -357,14 +357,19 @@ class SubprocessRuntime(BaseRuntime):
         Raises:
             ValueError: If validation rejects the code.
             SyntaxError: If the code cannot be parsed.
-            NotImplementedError: If namespace is passed for a language
-                that doesn't support it.
+            NotImplementedError: If ``namespace`` is passed; tool calls
+                require :class:`IpcSubprocessRuntime`.
         """
         self._validator.validate(code)
 
-        script = self._build_script(code, namespace)
+        if namespace:
+            raise NotImplementedError(
+                "SubprocessRuntime does not execute tool calls; use "
+                "IpcSubprocessRuntime for namespace injection."
+            )
+
         proc = subprocess.Popen(
-            [*self._validator.interpreter, script],
+            [*self._validator.interpreter, code],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -405,44 +410,14 @@ class SubprocessRuntime(BaseRuntime):
             finally:
                 _close_fd(pidfd)
 
-    def _build_script(
-        self,
-        code: str,
-        namespace: dict[str, Callable[..., Any]] | None,
-    ) -> str:
-        """Build the full script, prepending namespace stubs if needed."""
-        if not namespace:
-            return code
-
-        if self.lang != "python":
-            raise NotImplementedError(
-                f"Namespace injection is not supported for {self.lang!r}. "
-                "Only Python runtimes support callable namespace."
-            )
-
-        import json
-
-        stubs: list[str] = []
-        for name, fn in namespace.items():
-            doc = getattr(fn, "__doc__", None) or f"Stub for {name}"
-            doc_escaped = json.dumps(doc)
-            stubs.append(
-                f"def {name}(*args, **kwargs):\n"
-                f"    {doc_escaped}\n"
-                f"    raise NotImplementedError("
-                f"'Cannot call {name}() in subprocess mode')\n"
-            )
-
-        preamble = "\n".join(stubs)
-        return preamble + "\n" + code
-
 
 class IpcSubprocessRuntime(BaseRuntime):
     """Execute code in a subprocess with namespace callables via IPC.
 
-    Unlike :class:`SubprocessRuntime` (which injects stubs that raise),
-    this runtime establishes a bidirectional JSON pipe so the
-    subprocess code can **actually call** the namespace functions.
+    Unlike :class:`SubprocessRuntime`, which rejects namespace injection
+    because it has no call channel, this runtime establishes a
+    bidirectional JSON pipe so subprocess code can **actually call** the
+    namespace functions.
     Tool execution always happens in the main process — only the
     LLM-generated code runs in the subprocess.
 
@@ -517,7 +492,7 @@ class IpcSubprocessRuntime(BaseRuntime):
                 "Only Python runtimes support callable namespace."
             )
 
-        # Build tool_docs: {name: docstring} for the subprocess stubs
+        # Build tool_docs: {name: docstring} for the IPC stubs
         tool_docs: dict[str, str | None] = {}
         if namespace:
             for name, fn in namespace.items():

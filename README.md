@@ -38,19 +38,6 @@ py.execute("import math; print(math.sqrt(16))")
 py.execute("import os; os.system('rm -rf /')")  # raises ValueError
 ```
 
-### Bash (deny-list, being removed)
-
-Regex-based deny list blocks known-dangerous patterns. **Not a sandbox** — reduces risk but cannot guarantee safety, and quoting defeats it (`su''do id` passes). The backend has no consumer and is removed in 0.3.0; shell execution policy belongs to [`bashtool`](https://github.com/Oaklight/bashtool).
-
-```python
-from codecell import SubprocessRuntime
-from codecell.bash import BashValidator
-
-bash = SubprocessRuntime(BashValidator())
-bash.execute("echo hello && ls -la")   # OK
-bash.execute("rm -rf /")               # raises ValueError
-```
-
 ### Trusted code (no validation)
 
 ```python
@@ -74,18 +61,23 @@ Guarantees are per backend and only count when the OS enforces them. Full table,
 
 ## Namespace injection (Python only)
 
-Inject callables into the execution namespace. In subprocess mode, they're available as stubs for discovery:
+Inject callables into the execution namespace. `SubprocessRuntime` has no call channel and raises `NotImplementedError` when `namespace` is passed; use `IpcSubprocessRuntime` (next section) so tools actually run.
 
 ```python
+from codecell import IpcSubprocessRuntime
+from codecell.python import PythonValidator
+
+
 def search(query: str) -> list:
     """Search for documents."""
-    ...
+    return [f"result for {query}"]
 
-result = py.execute(
-    "print('search' in dir())",
+
+result = IpcSubprocessRuntime(PythonValidator()).execute(
+    "print(search(query='x'))",
     namespace={"search": search},
 )
-# stdout: "True"
+# stdout: "['result for x']\n"
 ```
 
 ### Tool calls over IPC
@@ -140,12 +132,12 @@ Execute code in a subprocess. The validator provides language identity and code 
 | Validator | Security level | Language |
 |-----------|---------------|----------|
 | `PythonValidator` | Advisory (AST allow-list, bypassable) | Python |
-| `BashValidator` | Advisory (regex deny-list); removed in 0.3.0 | Bash |
 | `NullValidator(lang)` | None — trusted code only | Any |
 
 ## Documentation
 
 - [RUNTIME_CONTRACT.md](https://github.com/Oaklight/codecell/blob/master/RUNTIME_CONTRACT.md) — the IPC wire protocol, the runtime/caller division of responsibility, and the checklist a new backend must satisfy.
+- [MIGRATION.md](https://github.com/Oaklight/codecell/blob/master/MIGRATION.md) — breaking changes, including the 0.3.0 bash backend and namespace stub-mode removal.
 
 ## License
 

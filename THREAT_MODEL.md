@@ -14,12 +14,11 @@ what the kernel enforces and what it merely advises.
 ## 1. Scope
 
 In scope: the execution path of `SubprocessRuntime` and `IpcSubprocessRuntime`; the
-advisory behaviour of `PythonValidator`, `BashValidator`, and `NullValidator`; output
-capture and truncation; and timeout/kill behaviour.
+advisory behaviour of `PythonValidator` and `NullValidator`; output capture and
+truncation; and timeout/kill behaviour.
 
-One thing is in scope about the shipped bash validator and nothing more: documenting that
-its regex deny list is bypassable (§7.2). Its design, policy, and hardening are out of
-scope, because 0.3.0 removes the backend (#8) and shell execution policy lives in
+The 0.2.1 `BashValidator` is documented only to record that its regex deny list is
+bypassable (§7.2). 0.3.0 removes it (#8); shell execution policy lives in
 `Oaklight/bashtool` and `toolregistry-hub`.
 
 Out of scope for 0.3.0: `ContainerRuntime` (0.4.0), stateful sessions, remote sandboxes,
@@ -82,7 +81,7 @@ Anything not graded ENFORCED is not a guarantee.
 | Wall-clock bound on the **direct child** | ENFORCED, when `timeout` is set | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child. The API default is `timeout=None`, which is unbounded |
 | Wall-clock bound on the process **tree** | ENFORCED on POSIX when `timeout` is set; PARTIAL on Windows | `start_new_session=True`, then `killpg(SIGTERM)` → 1 s grace → `killpg(SIGKILL)` on timeout, cancellation, and exceptions (#6). Windows signals only the direct child, so grandchildren may survive |
 | Filesystem, network, env, PID, resource limits | NONE | No namespace, seccomp, rlimit, cgroup, or uid change |
-| Code validation | ADVISORY | `ast` walk (`PythonValidator`) or regex (`BashValidator`) |
+| Code validation | ADVISORY | `ast` walk (`PythonValidator`); the `BashValidator` regex backend was removed in 0.3.0 (#8) |
 
 ## 6. Per-backend guarantee table
 
@@ -110,15 +109,15 @@ the top grade.
 | **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: no pid namespace) | NONE | TARGET — PID namespace, no host PIDs |
 | **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | TARGET — cgroup memory/CPU/pids limits |
 | **Timeout / kill semantics** | PARTIAL — group SIGTERM→SIGKILL on POSIX (#6); direct child only on Windows; captured output is returned | PARTIAL — same | PARTIAL — same; `stderr` is drained continuously into a bounded buffer (#5), so it cannot backpressure the child | TARGET — container stop kills the whole cgroup |
-| **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — positional/keyword calls and a JSON+tag codec (#7); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
+| **Tool access** (injected namespace) | NONE — no call channel; passing `namespace` raises `NotImplementedError` | NONE — same | ADVISORY — positional/keyword calls and a JSON+tag codec (#7); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
 | **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — child-side `StringIO`, shipped as one JSON line, buffered by the parent's reader and `json.loads` | TARGET — bounded at collection inside the container |
 
 Notes:
 
-- The bash backend (`SubprocessRuntime` + `BashValidator`) is deliberately omitted from
-the comparison: 0.3.0 removes it (no consumer, drifted from `Oaklight/bashtool`). Where
-it existed, its guarantee was ADVISORY(regex deny list) over an otherwise identical
-NONE-everything runtime — see §7.2 for a reproduced bypass.
+- The bash backend (`SubprocessRuntime` + `BashValidator`) was removed in 0.3.0 (#8): no
+consumer, and it had drifted from `Oaklight/bashtool`. On 0.2.1 its guarantee was
+ADVISORY(regex deny list) over an otherwise identical NONE-everything runtime — see §7.2
+for a reproduced bypass.
 - Output size is PARTIAL everywhere: `truncate()` runs in the parent after
   `capture_output=True` has buffered the entire stream (measured: 20 MB of stdout →
   parent peak RSS +57.4 MB). The cap bounds what reaches the LLM context, not what
@@ -154,7 +153,7 @@ the escapes above: `import sys` and `import os` are refused, `import io` is allo
 `io.open` is the first bypass in the table. That asymmetry is the point: it is a UX and
 prompt-hygiene tool with a security-shaped API, which is why the docs must say so.
 
-### 7.2 `BashValidator` (regex deny list)
+### 7.2 `BashValidator` (regex deny list, removed in 0.3.0)
 
 Measured against the shipped deny list, of five forms tested four pass validation: `sudo
 id` is blocked; `su''do id`, `s\udo id`, `r''m -rf /tmp/whatever`, and
@@ -218,7 +217,7 @@ isolated; run codecell with the privileges you would give that code"*.
 | `stderr` drain | #5 | Shipped in 0.3.0: removes the backpressure hang from the timeout/kill row and returns captured `stderr` on normal, timeout, and crash paths |
 | process-group kill on timeout and cancellation | #6 | Shipped in 0.3.0: the timeout/kill row is tree-bounded on POSIX; Windows remains direct-child-only |
 | tool-call arguments, result codec, protocol version | #7 | Shipped in 0.3.0: removes the kwargs-only and non-JSON failure modes from the tool-access cell |
-| bash backend removal | #8 | Deletes an ADVISORY-only surface, and the allow-list confusion that came with it |
+| bash backend removal | #8 | Shipped in 0.3.0: deletes an ADVISORY-only surface and the namespace stub mode; shell policy stays in `bashtool` |
 | regression suite | #11 | Every reproduction in §7–§8 becomes an executable test |
 
 Until `ContainerRuntime` ships, the sentence to repeat in docs and reviews is:
