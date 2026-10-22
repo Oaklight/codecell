@@ -1,5 +1,7 @@
 """Tests for IpcSubprocessRuntime — bidirectional IPC tool calling."""
 
+import os
+
 import pytest
 
 from codecell import IpcSubprocessRuntime
@@ -224,3 +226,39 @@ class TestIpcProtocolChannel:
         assert result.stdout.strip() == "before"
         assert result.return_code == 130
         assert result.timed_out is False
+
+    def test_garbage_frames_are_ignored(self):
+        from codecell import IpcSubprocessRuntime, NullValidator
+
+        runtime = IpcSubprocessRuntime(NullValidator("python"))
+        code = (
+            "import os\n"
+            "for fd in range(256, 300):\n"
+            "    for payload in (b'garbage-not-json\\n', b'42\\n', b'null\\n'):\n"
+            "        try:\n"
+            "            os.write(fd, payload)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "print('ok')"
+        )
+        result = runtime.execute(code, timeout=5)
+        assert result.stdout.strip() == "ok"
+        assert result.return_code == 0
+        assert result.timed_out is False
+
+    def test_system_exit_object_reports_repr(self, runtime):
+        code = "class C:\n    def __repr__(self):\n        return 'boom'\nraise SystemExit(C())"
+        result = runtime.execute(code, timeout=5)
+        assert result.return_code == 1
+        assert result.stderr.strip() == "boom"
+
+    def test_high_fd_relocation_respects_limit(self, monkeypatch):
+        from codecell import _ipc_bootstrap
+
+        monkeypatch.setattr(_ipc_bootstrap, "_fd_limit", lambda: 16)
+        fd = os.dup(1)
+        moved = _ipc_bootstrap._move_to_high_fd(fd)
+        try:
+            assert 3 <= moved < 16
+        finally:
+            os.close(moved)

@@ -50,19 +50,42 @@ _HIGH_FD_START = 256
 _HIGH_FD_SEARCH = 256
 
 
+def _fd_limit() -> int:
+    """Return the soft ``RLIMIT_NOFILE``, or a conservative fallback."""
+    try:
+        import resource
+    except ImportError:  # Windows
+        return 2048
+    try:
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except OSError:
+        return 2048
+    if soft == resource.RLIM_INFINITY:
+        return 4096
+    return int(soft)
+
+
 def _move_to_high_fd(fd: int) -> int:
     """Relocate *fd* to a free descriptor above ``_HIGH_FD_START``.
 
     Predictable low descriptors (3, 4, ...) are easy for user code to
     close or write to; a high descriptor makes accidental interference
     unlikely.  Frame introspection can still reach the writer, so this is
-    hardening rather than a boundary.
+    hardening rather than a boundary.  The search is bounded by the
+    process's ``RLIMIT_NOFILE``; if no candidate is available the original
+    descriptor is kept so the channel still works.
     """
-    for candidate in range(_HIGH_FD_START, _HIGH_FD_START + _HIGH_FD_SEARCH):
+    limit = _fd_limit()
+    start = min(_HIGH_FD_START, max(3, limit // 2))
+    end = min(start + _HIGH_FD_SEARCH, limit)
+    for candidate in range(start, end):
         try:
             os.fstat(candidate)
         except OSError:
-            os.dup2(fd, candidate)
+            try:
+                os.dup2(fd, candidate)
+            except OSError:
+                continue
             os.close(fd)
             return candidate
     return fd
@@ -182,15 +205,17 @@ def main() -> None:
     except BaseException as exc:  # noqa: BLE001 - terminal frame is mandatory
         rc = _exit_code(exc)
         if isinstance(exc, SystemExit):
-            # A clean exit is not an error; only a string code is a message.
-            stderr_text = f"{exc.code}\n" if isinstance(exc.code, str) else ""
+            # A clean exit is not an error; only a message is reported.
+            if isinstance(exc.code, str):
+                stderr_text = f"{exc.code}\n"
+            elif exc.code is None or isinstance(exc.code, int):
+                stderr_text = ""
+            else:
+                stderr_text = f"{exc.code!r}\n"
         else:
             stderr_text = traceback.format_exc()
     finally:
-        try:
-            stdout_text = captured_stdout.getvalue()
-        except Exception:  # pragma: no cover - defensive
-            stdout_text = ""
+        stdout_text = captured_stdout.getvalue()
         send_to_main(
             {
                 "type": "done",

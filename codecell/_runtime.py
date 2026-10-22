@@ -429,19 +429,33 @@ class IpcSubprocessRuntime(BaseRuntime):
                     timed_out=False,
                 )
 
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                # User code or an escaped descendant wrote to the channel.
+                # Ignore garbage rather than failing the whole cell.
+                continue
+            if not isinstance(msg, dict):
+                continue
 
-            if msg["type"] == "done":
+            msg_type = msg.get("type")
+
+            if msg_type == "done":
+                stdout = msg.get("stdout", "")
+                stderr = msg.get("stderr", "")
+                rc = msg.get("rc", 0)
                 return CodeResult(
-                    stdout=truncate(msg.get("stdout", "")),
-                    stderr=truncate(msg.get("stderr", "")),
-                    return_code=msg.get("rc", 0),
+                    stdout=truncate(stdout if isinstance(stdout, str) else str(stdout)),
+                    stderr=truncate(stderr if isinstance(stderr, str) else str(stderr)),
+                    return_code=rc if isinstance(rc, int) else 1,
                     timed_out=False,
                 )
 
-            if msg["type"] == "call":
-                tool_name = msg["tool"]
-                kwargs = msg["kwargs"]
+            if msg_type == "call":
+                tool_name = msg.get("tool")
+                kwargs = msg.get("kwargs", {})
+                if not isinstance(tool_name, str) or not isinstance(kwargs, dict):
+                    continue
 
                 fn = namespace.get(tool_name)
                 if fn is None:
