@@ -147,8 +147,11 @@ class SubprocessRuntime(BaseRuntime):
     """Execute code in a subprocess for crash isolation.
 
     The code is validated via the provided :class:`Validator`, then run
-    in a fresh interpreter process.  Crashes, infinite loops, and
-    resource exhaustion cannot affect the calling process.
+    in a fresh interpreter process.  Only crashes are isolated by that
+    process boundary.  Child memory, CPU, and disk use are not limited,
+    output is buffered in full before truncation, and ``timeout=None``
+    can block indefinitely.  This is crash isolation, not a sandbox; see
+    ``THREAT_MODEL.md``.
 
     Usage::
 

@@ -1,7 +1,7 @@
 # Threat model and isolation guarantees
 
-Status: describes **codecell 0.2.1** as measured, and the targets for 0.3.0 (issues
-#5–#8). Evidence for every claim below was produced by running code, not by reading
+Status: describes **codecell 0.2.1** as measured, the fixes targeted for 0.3.0 (issues
+#5–#8), and the design targets for the 0.4.0 container backend. Evidence for every claim below was produced by running code, not by reading
 it; the commands are in [Reproduced evidence](#reproduced-evidence).
 
 This document exists because the README previously advertised Python validation as
@@ -13,13 +13,17 @@ what the kernel enforces and what it merely advises.
 
 ## 1. Scope
 
-In scope: the execution path of `SubprocessRuntime` and `IpcSubprocessRuntime`, the
-`PythonValidator` / `BashValidator` / `NullValidator` advisory checks, output capture and
-truncation, and timeout/kill behaviour.
+In scope: the execution path of `SubprocessRuntime` and `IpcSubprocessRuntime`; the
+advisory behaviour of `PythonValidator`, `BashValidator`, and `NullValidator`; output
+capture and truncation; and timeout/kill behaviour.
+
+One thing is in scope about the shipped bash validator and nothing more: documenting that
+its regex deny list is bypassable (§7.2). Its design, policy, and hardening are out of
+scope, because 0.3.0 removes the backend (#8) and shell execution policy lives in
+`Oaklight/bashtool` and `toolregistry-hub`.
 
 Out of scope for 0.3.0: `ContainerRuntime` (0.4.0), stateful sessions, remote sandboxes,
-multi-language backends, and the bash deny list (0.3.0 removes the bash backend; policy
-for shell execution lives in `Oaklight/bashtool` and `toolregistry-hub`).
+and multi-language backends.
 
 ## 2. Assets
 
@@ -63,37 +67,48 @@ Consequences that follow from the rule and are easy to get wrong:
 
 ## 5. What the runtime actually enforces (0.2.1)
 
-Measured, not inferred. Everything not in this list is **not** enforced.
+Every grade below was measured on 0.2.1. Anything not graded ENFORCED is not a
+guarantee.
 
-| Property | Enforced? | Mechanism |
+| Property | Grade | Mechanism and measurement |
 |---|---|---|
-| Crash isolation | Yes | Separate OS process (`subprocess.run` / `Popen`) |
-| Interpreter/global-state isolation per call | Yes | Fresh interpreter per `execute()` |
-| Output size cap | Yes | `truncate()` at 65 536 UTF-8 bytes per stream, in-process |
-| Wall-clock bound on the **direct child** | Yes | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child |
-| Wall-clock bound on the process **tree** | **No** | No process group / no `setsid`; grandchildren survive (measured: `sleep 90` still alive after `timed_out=True`) |
-| Filesystem, network, env, PID, resource limits | **No** | No namespace, seccomp, rlimit, cgroup, or uid change |
-| Code validation | **Advisory** | `ast` walk (`PythonValidator`) or regex (`BashValidator`) |
+| Crash isolation | ENFORCED | Separate OS process (`subprocess.run` / `Popen`) |
+| Interpreter and global state per call | ENFORCED | Fresh interpreter per `execute()` |
+| Caller memory read | ENFORCED | Separate address space; nothing is shared or pickled into the child |
+| **Returned output size** | **PARTIAL** | `truncate()` caps the returned string at 65 536 bytes + marker, but `capture_output=True` buffers the **whole** stream in the parent first. Measured: 20 MB of stdout → parent peak RSS +57.4 MB, returned string 65 559 bytes |
+| Wall-clock bound on the **direct child** | ENFORCED | `subprocess.run(timeout=…)` → `SIGKILL` to the direct child |
+| Wall-clock bound on the process **tree** | PARTIAL | Same `SIGKILL`, direct child only. No process group / no `setsid`; grandchildren survive (measured: `sleep 90` still alive after `timed_out=True`; #6) |
+| Filesystem, network, env, PID, resource limits | NONE | No namespace, seccomp, rlimit, cgroup, or uid change |
+| Code validation | ADVISORY | `ast` walk (`PythonValidator`) or regex (`BashValidator`) |
 
 ## 6. Per-backend guarantee table
 
-Legend — **ENFORCED(mechanism)**: the mechanism is an OS/container control.
-**ADVISORY(check)**: a text check that a determined author bypasses.
-**NONE**: nothing stands between the code and the asset.
+Legend — every grade describes one backend as shipped, and only OS-level controls earn
+the top grade.
 
-| Capability | `SubprocessRuntime` + `NullValidator` | `SubprocessRuntime` + `PythonValidator` | `IpcSubprocessRuntime` (+ either validator) | `ContainerRuntime` (0.4.0 target) |
+- **ENFORCED(mechanism)** — an OS, kernel, or container control enforces it; measured on
+  0.2.1.
+- **PARTIAL(mechanism)** — an OS control exists but covers only part of the capability.
+  The uncovered part is named in the same cell.
+- **ADVISORY(check)** — only a text check, a stub signature, or a convention stands
+  between the code and the asset. A determined author bypasses it.
+- **NONE** — nothing stands between the code and the asset.
+- **TARGET(mechanism)** — the control the 0.4.0 `ContainerRuntime` is *designed* to use.
+  There is no implementation, so nothing is measured: these cells are a specification,
+  not a guarantee, and must never be cited as current behaviour.
+
+| Capability | `SubprocessRuntime` + `NullValidator` | `SubprocessRuntime` + `PythonValidator` | `IpcSubprocessRuntime` (+ either validator) | `ContainerRuntime` (0.4.0) |
 |---|---|---|---|---|
-| **Code visibility** (can code read the caller's memory?) | NONE — separate process, no shared address space | Same | Same; code is sent over the pipe and `exec`'d in the child | ENFORCED — separate container filesystem/process namespace |
-| **Injected tool namespace** | NONE — callables are not injected; stubs raise | NONE — same | ADVISORY — code can only call injected names, but each call runs with full main-process authority; no per-tool allow-list | ENFORCED (0.4.0, by absence of IPC channel), ADVISORY before that |
-| **Host filesystem read** | NONE — child runs as caller uid | NONE — `import io` is allowed (`io` is on the allow-list) and `io.open` reads any readable path (measured) | NONE — same | ENFORCED — read-only or absent mounts, container rootfs |
-| **Host filesystem write** | NONE | NONE — `io.open(path, 'w')` writes anywhere the caller can (measured) | NONE | ENFORCED — read-only mounts, no host bind by default |
-| **Network egress** | NONE | NONE — `socket` reached via `getattr(__builtins__, '__import__')` (measured: connect attempt made) | NONE | ENFORCED — `network=none` / no interface |
-| **Environment and secrets** | NONE — full env inherited | NONE — same env, reachable despite `os` being denied (measured: `HOME`, `USER`) | NONE — and tool calls additionally see main-process objects | ENFORCED — explicit, minimal env pass-through |
-| **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: pid-namespace not used) | NONE | ENFORCED — PID namespace, no host PIDs |
-| **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | ENFORCED — cgroup memory/CPU/pids limits |
-| **Timeout / kill semantics** | Partial — direct child `SIGKILL`ed; **tree leaks** (measured) | Partial — same | Partial — same, plus undrained `stderr` can stall the child until the deadline (measured: 200 KB write → hang until timeout) | ENFORCED — container stop kills the whole tree |
-| **Tool access** (PTC namespace) | NONE — stubs raise `NotImplementedError` | NONE — same | ADVISORY — kwargs-only stubs, non-JSON results turn success into a traceback (measured) | ENFORCED by the tool layer, not by codecell |
-| **Output containment** | ENFORCED(truncate, 64 KB per stream) — but the cap is applied after the child has already produced the bytes | Same | Same | Same |
+| **Caller memory read** | ENFORCED — separate address space | ENFORCED — same | ENFORCED — code crosses the pipe as text; caller state stays in the main process | TARGET — separate container address space (no gain over the subprocess here) |
+| **Host filesystem read** | NONE — child runs as caller uid | NONE — `io` is allowed (`io` is on the allow-list) and `io.open` reads any readable path (measured) | NONE — same | TARGET — container rootfs, read-only or absent mounts |
+| **Host filesystem write** | NONE | NONE — `io.open(path, 'w')` writes anywhere the caller can (measured) | NONE | TARGET — read-only mounts, no host bind by default |
+| **Network egress** | NONE | NONE — `socket` reached via `getattr(__builtins__, '__import__')` (measured: connect attempt made) | NONE | TARGET — `network=none` / no interface |
+| **Environment and secrets** | NONE — full env inherited | NONE — same env, reachable despite `os` being denied (measured: `HOME`, `USER`) | NONE — plus every tool call sees the main process's objects | TARGET — explicit, minimal env pass-through |
+| **Process spawn** | NONE — `subprocess` reachable | NONE — reachable via the same escape (measured: no pid namespace) | NONE | TARGET — PID namespace, no host PIDs |
+| **Resource exhaustion** | NONE — no rlimits (`Max address space`, `Max cpu time`, `Max file size` all `unlimited`; measured) | NONE | NONE | TARGET — cgroup memory/CPU/pids limits |
+| **Timeout / kill semantics** | PARTIAL — `SIGKILL` to the direct child; tree leaks (measured: grandchild alive) | PARTIAL — same | PARTIAL — same, plus an undrained `stderr` stalls the child until the deadline (measured: 200 KB → hang until timeout; #5) | TARGET — container stop kills the whole cgroup |
+| **Tool access** (injected namespace) | NONE — no call channel; stubs raise `NotImplementedError` | NONE — same | ADVISORY — kwargs-only stub signature, JSON-only results turn a successful call into a failure (measured); each call runs with the main process's full authority, so a tool is a capability grant | TARGET — no IPC channel in the 0.4.0 design; tool access only via what the host routes in |
+| **Returned output size** | PARTIAL — `truncate()` after capture; the parent buffers the full stream first (measured: 20 MB → RSS +57.4 MB, 65 559 bytes returned) | PARTIAL — same | PARTIAL — same | TARGET — bounded at collection inside the container |
 
 Notes:
 
@@ -101,17 +116,22 @@ Notes:
 the comparison: 0.3.0 removes it (no consumer, drifted from `Oaklight/bashtool`). Where
 it existed, its guarantee was ADVISORY(regex deny list) over an otherwise identical
 NONE-everything runtime — see §7.2 for a reproduced bypass.
-- "ENFORCED" for `CodeResult` only covers output size. Truncation happens after capture,
-  so a child can still emit unbounded data to its own pipes/disk; only the returned
-  string is capped.
+- Output size is PARTIAL everywhere: `truncate()` runs in the parent after
+  `capture_output=True` has buffered the entire stream (measured: 20 MB of stdout →
+  parent peak RSS +57.4 MB). The cap bounds what reaches the LLM context, not what
+  reaches the parent's memory.
+- Every cell in the `ContainerRuntime` column is TARGET. §5's "measured, not inferred"
+  rule applies to the three shipped columns only; the container column is design intent
+  for 0.4.0 and is not evidence of current behaviour.
 
 ## 7. Known validator bypasses
 
 ### 7.1 `PythonValidator` (AST allow-list)
 
-All of these execute successfully under `SubprocessRuntime(PythonValidator())` on 0.2.1
-and read or write arbitrary host files. Verbatim outputs in
-[Reproduced evidence](#reproduced-evidence).
+All four execute successfully under `SubprocessRuntime(PythonValidator())` on 0.2.1.
+Three of them read or write arbitrary host files; the fourth (`__subclasses__`) is the
+primitive that exposes every loaded class, which is what makes the other three cheap to
+rediscover. Verbatim outputs in [Reproduced evidence](#reproduced-evidence).
 
 | # | Bypass | Why the AST check misses it |
 |---|---|---|
@@ -182,9 +202,10 @@ isolated; run codecell with the privileges you would give that code"*.
 
 | Change | Issue | Effect on this document |
 |---|---|---|
-| Container backend | 0.4.0 / `ContainerRuntime` | First backend permitted to claim T1/T2 isolation; the table gains an enforced column |
-| stderr drain + process-group kill | #5 | Moves timeout/kill from *partial* to *tree-bounded* |
-| tool-call ergonomics, result encoding | #6, #7 | Removes kwargs-only and non-JSON failure modes |
+| Container backend | 0.4.0 / `ContainerRuntime` | The only backend permitted to claim T1/T2 isolation; each TARGET cell becomes ENFORCED only after it is measured |
+| `stderr` drain | #5 | Removes the backpressure hang from the timeout/kill row |
+| process-group kill on timeout and cancellation | #6 | Moves the timeout/kill row from PARTIAL to tree-bounded |
+| tool-call arguments, result codec, protocol version | #7 | Removes the kwargs-only and non-JSON failure modes from the tool-access cell |
 | bash backend removal | #8 | Deletes an ADVISORY-only surface, and the allow-list confusion that came with it |
 | regression suite | #11 | Every reproduction in §7–§8 becomes an executable test |
 
@@ -221,6 +242,10 @@ rt.execute("print(len(object.__subclasses__()), 'subclasses reachable')")
 
 # write anywhere the caller can (measured on /tmp)
 rt.execute("import io; io.open('/tmp/codecell-probe-write.txt', 'w').write('written')")
+
+# the output cap is not memory isolation: the full stream is buffered in the parent
+rt.execute("print('x' * 20_000_000)")
+# returned stdout 65 559 bytes, parent peak RSS +57.4 MB (measured)
 
 # secrets: env is inherited and reachable through the escape
 rt.execute("print((lambda: 0).__globals__['__builtins__'].__import__('os').environ['HOME'])")

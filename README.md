@@ -2,7 +2,7 @@
 
 Stateless, subprocess-isolated code execution for LLM agents. Zero dependencies.
 
-> Unlike a Jupyter cell, there's no shared kernel — each call runs in a fresh subprocess with only the tools you inject.
+> Unlike a Jupyter cell, there's no shared kernel — each call runs in a fresh subprocess with only the capabilities you explicitly route to it.
 
 **Scope:** codecell is a small, stateless execution kernel: run one code string in a fresh subprocess, optionally expose callables as tools, and return structured output. It is not a sandbox. Read [THREAT_MODEL.md](THREAT_MODEL.md) before executing code you would not run yourself.
 
@@ -66,9 +66,9 @@ Guarantees are per backend and only count when the OS enforces them. Full table,
 
 | Backend | Isolates | Does not isolate |
 |---------|----------|------------------|
-| `SubprocessRuntime` | Crashes, interpreter state (fresh process), output size (64 KB per stream) | Filesystem, network, environment, uid, resource use, process tree on timeout |
+| `SubprocessRuntime` | Crashes, interpreter state (fresh process), caller memory (separate address space) | Filesystem, network, environment, uid, resource use, process tree on timeout, output volume (the returned string is truncated at 64 KB, but the whole stream is buffered in the parent first) |
 | `IpcSubprocessRuntime` | Same | Same, and every tool call runs with the main process's full authority |
-| `ContainerRuntime` (0.4.0) | Target: filesystem, network, PIDs, resource limits | — |
+| `ContainerRuntime` — **target, 0.4.0, not shipped** | Nothing yet; the design targets filesystem, network, PIDs, and resource limits | — |
 
 `Validator` implementations are advisory: they catch accidents and steer the model's behaviour, and a determined author bypasses them in one line. In PTC the capability boundary is the injected tool namespace plus the process or container the code runs in — never the code check.
 
